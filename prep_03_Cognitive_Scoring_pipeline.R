@@ -7,10 +7,15 @@
 #   <script_dir>/01_project_data/<project>_backbone/raw_data/experiment_data/
 # Legacy fallback (per project):
 #   <script_dir>/01_project_data/<project>_backbone/experiment_data/
+# The _cogtests.xlsx overview files list participant IDs and raw test filenames.
+# Children's overview files use children_parents; their raw folders use children.
 #
 # Output (per project):
 #   <script_dir>/01_project_data/<project>_backbone/derivatives/experiment_data/
 # The project folder, internal structure, and every input date stamp are retained.
+# Exported source-file references contain filenames only for RU-wide sharing.
+# Children's trial folders use children. Projects 6/8
+# collected WCST only for children; BACS/LNS are labelled "Nicht erhoben".
 #
 # Methodological note:
 # The FHS questionnaire block from the internship script is intentionally not
@@ -63,11 +68,9 @@ script_directory <- function() {
 script_dir <- script_directory()
 project_data_dir <- file.path(script_dir, "01_project_data")
 
-if (!dir.exists(project_data_dir) || !any(
-  basename(list.dirs(project_data_dir, recursive = TRUE, full.names = TRUE)) == "experiment_data"
-)) {
+if (!dir.exists(project_data_dir)) {
   stop(
-    "No project-level experiment_data folder found below: ",
+    "Project data directory does not exist: ",
     normalizePath(project_data_dir, winslash = "/", mustWork = FALSE)
   )
 }
@@ -102,6 +105,11 @@ safe_max <- function(x) {
 
 normalize_path <- function(path) {
   normalizePath(path, winslash = "/", mustWork = FALSE)
+}
+
+export_filename <- function(path) {
+  # Handle both Windows and forward-slash paths; preserve missing values.
+  basename(gsub("\\\\", "/", as.character(path)))
 }
 
 relative_path <- function(path, root) {
@@ -160,6 +168,7 @@ read_trial_file <- function(path, column_names) {
   )
   if (inherits(out, "error") || is.null(out) || !nrow(out)) {
     detail <- if (inherits(out, "error")) conditionMessage(out) else "Datei leer"
+    detail <- gsub(path, export_filename(path), detail, fixed = TRUE)
     return(list(data = NULL, error = paste0("Datei leer/Lesefehler: ", detail), original_ncol = 0L))
   }
   original_ncol <- ncol(out)
@@ -210,31 +219,52 @@ parse_master_name <- function(path) {
 }
 
 discover_master_files <- function(root) {
-  candidates <- list.files(
-    root,
-    pattern = "_cogtests(_exp-[12])?\\.xlsx$",
-    recursive = TRUE,
-    full.names = TRUE,
-    ignore.case = TRUE
+  # Start at each project's experiment_data folder, rather than relying on
+  # recursive traversal from the common 01_project_data parent directory.
+  project_folders <- paste0(c(as.character(2:9), "all_projects"), "_backbone")
+  search_directories <- c(
+    file.path(root, project_folders, "raw_data", "experiment_data"),
+    file.path(root, project_folders, "experiment_data")
   )
+  existing_directories <- search_directories[dir.exists(search_directories)]
+  candidates <- unique(unlist(lapply(existing_directories, function(directory) {
+    list.files(
+      directory,
+      pattern = "_cogtests(_exp-[12])?\\.xlsx$",
+      recursive = TRUE,
+      full.names = TRUE,
+      ignore.case = TRUE
+    )
+  }), use.names = FALSE))
+  if (is.null(candidates)) candidates <- character()
   normalized <- normalize_path(candidates)
   candidates <- candidates[!grepl(
     "(^|/)(old_data|discarded|derivatives)(/|$)",
     normalized,
     ignore.case = TRUE
   )]
-  # Refuse the incorrect transient layout 01_project_data/raw_data/... . Only
-  # project-level raw_data directories are valid inputs.
-  candidates <- candidates[!grepl(
-    "^raw_data/",
-    relative_path(candidates, project_data_dir),
-    ignore.case = TRUE
-  )]
   candidates <- candidates[!startsWith(basename(candidates), "~$")]
   parsed <- lapply(candidates, parse_master_name)
   parsed <- parsed[!vapply(parsed, is.null, logical(1))]
   if (!length(parsed)) {
-    stop("No valid cognitive-test master Excel files found below: ", normalize_path(root))
+    seen <- unique(unlist(lapply(existing_directories, function(directory) {
+      list.files(directory, pattern = "\\.xlsx$", recursive = TRUE,
+                 full.names = TRUE, ignore.case = TRUE)
+    }), use.names = FALSE))
+    if (is.null(seen)) seen <- character()
+    seen <- relative_path(utils::head(seen, 20L), root)
+    stop(
+      "No cognitive-test overview Excel file found in the project experiment_data folders.\n",
+      "Expected names such as 6_2026-10-06_children_parents_cogtests.xlsx.\n",
+      "Existing folders searched directly:\n",
+      if (length(existing_directories)) {
+        paste(normalize_path(existing_directories), collapse = "\n")
+      } else {
+        paste0("(none found below ", normalize_path(root), ")")
+      }, "\n",
+      "Excel files seen there (first 20):\n",
+      if (length(seen)) paste(seen, collapse = "\n") else "(none)"
+    )
   }
   parsed
 }
@@ -245,14 +275,31 @@ candidate_data_directories <- function(master, root) {
     file.path(root, "all_projects_backbone", "raw_data", "experiment_data"),
     file.path(root, "all_projects_backbone", "experiment_data")
   )
+  if (master$sample == "children_parents" && master$scope == "ALL") {
+    # A combined children's master can reference raw WCST files stored only in
+    # the individual projects. Keep the separate Project 6/8 data in place.
+    child_projects <- paste0(c("6", "8"), "_backbone")
+    fallback <- c(
+      fallback,
+      file.path(root, child_projects, "raw_data", "experiment_data"),
+      file.path(root, child_projects, "experiment_data")
+    )
+  }
   search_roots <- unique(c(master_dir, fallback[file.exists(fallback)]))
   directories <- unique(unlist(lapply(search_roots, function(x) {
     list.dirs(x, recursive = TRUE, full.names = TRUE)
   }), use.names = FALSE))
   directories <- directories[grepl("_cogtest_data", basename(directories), ignore.case = TRUE)]
+  # Fixed PsyToolkit naming: children_parents in the overview, children in the
+  # raw-data folder. Adults and adolescents keep their respective sample name.
+  data_sample <- if (master$sample == "children_parents") {
+    "children"
+  } else {
+    master$sample
+  }
   directories <- directories[
     grepl(
-      tolower(paste0("_", master$sample, "_cogtest_data")),
+      tolower(paste0("_", data_sample, "_cogtest_data")),
       tolower(basename(directories)),
       fixed = TRUE
     )
@@ -742,6 +789,18 @@ process_master <- function(master) {
   bacs_column <- first_existing_column(master_df, c("BACS"))
   wcst_column <- first_existing_column(master_df, c("WCST"))
   lns_column <- first_existing_column(master_df, c("LNS"))
+  # Projects 6 and 8 collected WCST only in their children's sample.
+  children_wcst_only <- rep(
+    master$sample == "children_parents" && master$scope %in% c("6", "8"),
+    nrow(master_df)
+  )
+  if (master$sample == "children_parents" && master$scope == "ALL") {
+    project_column <- first_existing_column(master_df, c("p", "project"))
+    if (!is.na(project_column)) {
+      project_numbers <- gsub("[^0-9]", "", as.character(master_df[[project_column]]))
+      children_wcst_only <- project_numbers %in% c("6", "8")
+    }
+  }
   directories <- candidate_data_directories(master, input_root)
   if (!length(directories)) {
     warning("No matching cogtest_data directory found for ", master$filename)
@@ -749,34 +808,45 @@ process_master <- function(master) {
 
   records <- vector("list", nrow(master_df))
   for (row in seq_len(nrow(master_df))) {
-    bacs_path <- resolve_trial_path(value_from_column(master_df, bacs_column, row), directories)
+    bacs_path <- if (children_wcst_only[row]) NA_character_ else
+      resolve_trial_path(value_from_column(master_df, bacs_column, row), directories)
     wcst_path <- resolve_trial_path(value_from_column(master_df, wcst_column, row), directories)
-    lns_path <- resolve_trial_path(value_from_column(master_df, lns_column, row), directories)
+    lns_path <- if (children_wcst_only[row]) NA_character_ else
+      resolve_trial_path(value_from_column(master_df, lns_column, row), directories)
     records[[row]] <- dplyr::bind_cols(
       tibble::tibble(
         source_row = row,
         sample = master$sample,
         score_vp_id = as.character(master_df[[id_column]][row]),
-        source_BACS_file = if (is.na(bacs_path)) NA_character_ else normalize_path(bacs_path)
+        source_BACS_file = export_filename(bacs_path),
+        source_WCST_file = export_filename(wcst_path),
+        source_LNS_file = export_filename(lns_path)
       ),
-      if (is.na(bacs_column)) empty_bacs_result("Nicht in Master angegeben") else score_bacs_single(bacs_path),
+      if (children_wcst_only[row]) empty_bacs_result("Nicht erhoben") else
+        if (is.na(bacs_column)) empty_bacs_result("Nicht in Master angegeben") else score_bacs_single(bacs_path),
       if (is.na(wcst_column)) empty_wcst_result("Nicht in Master angegeben") else score_wcst_single(wcst_path),
-      if (is.na(lns_column)) empty_lns_result("Nicht in Master angegeben") else score_lns_single(lns_path)
+      if (children_wcst_only[row]) empty_lns_result("Nicht erhoben") else
+        if (is.na(lns_column)) empty_lns_result("Nicht in Master angegeben") else score_lns_single(lns_path)
     )
   }
 
   results <- dplyr::bind_rows(records)
   results <- apply_bacs_participant_filter(results)
-  results$qc_duplicate_id_in_master <- duplicated(results$score_vp_id) |
-    duplicated(results$score_vp_id, fromLast = TRUE)
   results$all_available_tests_successful <-
-    (results$Status_BACS == "Nicht in Master angegeben" | grepl("^Erfolgreich", results$Status_BACS)) &
-    (results$Status_WCST == "Nicht in Master angegeben" | results$Status_WCST == "Erfolgreich") &
-    (results$Status_LNS == "Nicht in Master angegeben" | results$Status_LNS == "Erfolgreich")
+    (results$Status_BACS %in% c("Nicht in Master angegeben", "Nicht erhoben") | grepl("^Erfolgreich", results$Status_BACS)) &
+    ((results$Status_WCST == "Nicht in Master angegeben" & !children_wcst_only) | results$Status_WCST == "Erfolgreich") &
+    (results$Status_LNS %in% c("Nicht in Master angegeben", "Nicht erhoben") | results$Status_LNS == "Erfolgreich")
 
+  # Keep full paths internally for scoring; share only filenames in the export.
+  master_export <- as.data.frame(master_df, check.names = FALSE)
+  file_columns <- c(bacs_column, wcst_column, lns_column)
+  for (column in file_columns[!is.na(file_columns)]) {
+    master_export[[column]] <- export_filename(master_export[[column]])
+  }
   scores <- dplyr::bind_cols(
-    as.data.frame(master_df, check.names = FALSE),
-    results[, setdiff(names(results), "source_row"), drop = FALSE]
+    master_export,
+    # Keep the input's original ID only; duplicate diagnostics live elsewhere.
+    results[, setdiff(names(results), c("source_row", "score_vp_id")), drop = FALSE]
   )
   run_info <- tibble::tibble(
     field = c(
@@ -786,9 +856,9 @@ process_master <- function(master) {
       "bacs_trial_rt_filter", "bacs_participant_rt_filter"
     ),
     value = c(
-      normalize_path(master$path),
+      export_filename(master$path),
       master$date_stamp,
-      normalize_path(input_root),
+      export_filename(input_root),
       format(Sys.time(), "%Y-%m-%d %H:%M:%S", tz = "UTC"),
       master$sample,
       master$scope,

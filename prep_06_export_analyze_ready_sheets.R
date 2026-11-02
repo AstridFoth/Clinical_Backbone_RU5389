@@ -1,6 +1,6 @@
 # --- prep_06_export_analyze_ready_sheets.R ----------------------------------------------
 # FOR: Export HiTOP-mapped + COMPLETE questionnaire-only inputs for factor analysis
-# Date: 2026-09-14
+# Date: 2026-10-09
 #
 # Assumes:
 #   - Item-level clean master file in: ROOT/02_cleaned/<sample>/
@@ -18,6 +18,8 @@
 #      - ONLY item columns that have ANY HiTOP mapping in Item Information
 #   B) <input-date>_<samples>_HiTOP_subscales.xlsx
 #      - existing score_* columns created by prep05 for the SAME HiTOP-mapped scales
+#      - CAPE positive Schlier2015 factors: both _sum and _mean columns
+#        (frequency only; 0-3 item coding)
 #
 #   COMPLETE (questionnaire-only, explicitly configured below):
 #   D) <input-date>_<samples>_complete_items.xlsx
@@ -38,6 +40,7 @@
 #   same filenames with suffix _lt020 (or whatever threshold tag applies)
 #   -> items removed based on poor factor loadings
 #   -> scale/subscale scores recomputed from filtered item set
+#   -> CAPE positive Schlier2015 factors retain their fixed literature item sets
 #
 # Run:
 #   Rscript export_hitop_analysis_inputs.R --samples=adults,adolescents
@@ -350,6 +353,12 @@ read_master_robust <- function(master_path, default_delim = ";", clean_column_na
 
 # ---- Keys / scoring helpers --------------------------------------------------
 
+is_cape_positive_schlier2015_subscale <- function(scale, subscale) {
+  !is.na(scale) & toupper(trimws(as.character(scale))) == "CAPE" &
+    !is.na(subscale) & startsWith(tolower(trimws(as.character(subscale))),
+                                 "positive_schlier2015_")
+}
+
 drop_flagged_items_from_keys <- function(keys, flagged_tbl) {
   if (is.null(flagged_tbl) || !nrow(flagged_tbl)) return(keys)
   
@@ -363,6 +372,9 @@ drop_flagged_items_from_keys <- function(keys, flagged_tbl) {
   
   remove_flagged <- function(items, level, scale, subscale = NA_character_) {
     items <- as.character(items)
+    # Match Step 05: literature-defined factors keep all their frequency items.
+    if (identical(level, "subscale") &&
+        is_cape_positive_schlier2015_subscale(scale, subscale)) return(items)
     
     relevant_flags <- flags %>%
       dplyr::filter(
@@ -633,20 +645,55 @@ message("Output date: ", output_date)
 # -----------------------------
 # Build stratification tables
 # -----------------------------
+normalize_project_number <- function(x) {
+  x_norm <- x %>%
+    as.character() %>%
+    stringr::str_trim() %>%
+    stringr::str_to_lower() %>%
+    stringr::str_replace("^project[ _-]*", "") %>%
+    stringr::str_replace("^p[ _-]*", "")
+
+  x_num <- suppressWarnings(as.numeric(x_norm))
+  out <- suppressWarnings(as.integer(x_num))
+  out[is.na(x_num) | x_num != out | !(out %in% 2:9)] <- NA_integer_
+  out
+}
+
+normalize_group_label <- function(group, project) {
+  group_chr <- stringr::str_trim(as.character(group))
+  group_chr[!is.na(group_chr) & !nzchar(group_chr)] <- NA_character_
+  group_norm <- group_chr %>%
+    stringr::str_to_lower() %>%
+    stringr::str_replace_all("[^a-z0-9]+", "_") %>%
+    stringr::str_replace_all("^_+|_+$", "")
+
+  out <- dplyr::case_when(
+    group_norm %in% c("hc", "healthy_control", "healthy_controls", "control", "controls") ~ "HC",
+    group_norm %in% c("patient", "patients", "pat", "clinical", "case", "cases", "pp", "chr", "ar", "at_risk", "with_diagnosis") ~ "with_diagnosis",
+    TRUE ~ group_chr
+  )
+
+  project_number <- normalize_project_number(project)
+  out[is.na(out) & !is.na(project_number) & project_number %in% c(3L, 4L, 5L, 6L)] <- "HC"
+  out
+}
+
 make_strat <- function(obj) {
   d <- obj$d; id_col <- obj$id_col; sample <- obj$sample
   proj_col   <- pick_first(c("project", "p"), names(d))
   age_col    <- pick_first(c("age_years", "age"), names(d))
   gender_col <- pick_first(c("gender"), names(d))
-  group_col  <- pick_first(c("group"), names(d))
+  group_col  <- pick_first(CFG$enrichment_group_candidates, names(d))
+  project <- if (!is.na(proj_col)) as.character(d[[proj_col]]) else rep(NA_character_, nrow(d))
+  group <- if (!is.na(group_col)) as.character(d[[group_col]]) else rep(NA_character_, nrow(d))
   
   tibble::tibble(
     sample  = sample,
     !!id_col := as.character(d[[id_col]]),
-    project = if (!is.na(proj_col))   as.character(d[[proj_col]]) else NA_character_,
+    project = project,
     age     = if (!is.na(age_col))    suppressWarnings(as.numeric(d[[age_col]])) else NA_real_,
     gender  = if (!is.na(gender_col)) as.character(d[[gender_col]]) else NA_character_,
-    group   = if (!is.na(group_col))  as.character(d[[group_col]]) else NA_character_
+    group   = normalize_group_label(group, project)
   )
 }
 
@@ -768,6 +815,21 @@ expected_score_cols_from_keys <- function(
       ) %>%
       dplyr::select(.data$level, .data$scale, .data$subscale, .data$col) %>%
       dplyr::distinct()
+
+    # Step 05 writes explicit sum and mean columns for the additional CAPE
+    # factors, without an unsuffixed score column. Classical scores keep their
+    # existing names.
+    cape_rows <- is_cape_positive_schlier2015_subscale(
+      expected_sub$scale, expected_sub$subscale
+    )
+    if (any(cape_rows)) {
+      expected_cape <- expected_sub[cape_rows, , drop = FALSE]
+      expected_sub <- dplyr::bind_rows(
+        expected_sub[!cape_rows, , drop = FALSE],
+        expected_cape %>% dplyr::mutate(col = paste0(.data$col, "_sum")),
+        expected_cape %>% dplyr::mutate(col = paste0(.data$col, "_mean"))
+      )
+    }
   }
   
   expected_derived <- tibble::tibble()
@@ -842,6 +904,18 @@ export_existing_scores_tbl <- function(d_scored, id_col, keys_obj, scales,
   
   missing_not_created <- expected %>%
     dplyr::filter(!(.data$col %in% present))
+
+  missing_cape <- missing_not_created %>%
+    dplyr::filter(is_cape_positive_schlier2015_subscale(.data$scale, .data$subscale))
+  if (nrow(missing_cape)) {
+    stop(
+      "Score export is missing required CAPE Schlier2015 sum/mean columns",
+      if (!is.na(dataset_label)) paste0(" [", dataset_label, "]") else "",
+      ": ", paste(missing_cape$col, collapse = ", "),
+      ". Run the updated prep_05_Score_Scales.R first.",
+      call. = FALSE
+    )
+  }
   
   if (nrow(missing_not_created)) {
     for (i in seq_len(nrow(missing_not_created))) {
@@ -921,21 +995,6 @@ pick_first_col_norm <- function(cands, nms) {
   if (length(idx)) nms[idx[1]] else NA_character_
 }
 
-normalize_group_patient_hc <- function(x) {
-  x_chr <- as.character(x)
-  z <- x_chr %>%
-    stringr::str_trim() %>%
-    stringr::str_to_lower() %>%
-    stringr::str_replace_all("[^a-z0-9]+", "_") %>%
-    stringr::str_replace_all("^_+|_+$", "")
-  
-  dplyr::case_when(
-    z %in% c("hc", "healthy_control", "healthy_controls", "control", "controls") ~ "hc",
-    z %in% c("patient", "patients", "pat", "clinical", "case", "cases", "pp", "chr", "ar", "at_risk") ~ "patient",
-    TRUE ~ x_chr
-  )
-}
-
 make_enrichment_tbl <- function(obj, ii_rows,
                                 demographics_scale = CFG$enrichment_demographics_scale) {
   d <- obj$d
@@ -959,13 +1018,15 @@ make_enrichment_tbl <- function(obj, ii_rows,
   date_col <- pick_first_col_norm(CFG$enrichment_date_candidates, nms)
   project_col <- pick_first_col_norm(c("project", "p"), nms)
   group_col <- pick_first_col_norm(CFG$enrichment_group_candidates, nms)
+  project <- if (!is.na(project_col)) as.character(d[[project_col]]) else rep(NA_character_, nrow(d))
+  group <- if (!is.na(group_col)) as.character(d[[group_col]]) else rep(NA_character_, nrow(d))
   
   out <- tibble::tibble(
     !!id_col := as.character(d[[id_col]]),
     age_years = if (!is.na(age_col)) suppressWarnings(as.numeric(d[[age_col]])) else NA_real_,
     date = if (!is.na(date_col)) as.character(d[[date_col]]) else NA_character_,
-    project = if (!is.na(project_col)) as.character(d[[project_col]]) else NA_character_,
-    group = if (!is.na(group_col)) normalize_group_patient_hc(d[[group_col]]) else NA_character_
+    project = project,
+    group = normalize_group_label(group, project)
   )
   
   # Keep demographics item columns from Item Information, but avoid duplicate canonical fields.
@@ -1103,20 +1164,6 @@ make_complete_analysis_tables <- function(items_list, scores_list, masters) {
     )
   }
 
-  out
-}
-
-normalize_project_number <- function(x) {
-  x_norm <- x %>%
-    as.character() %>%
-    stringr::str_trim() %>%
-    stringr::str_to_lower() %>%
-    stringr::str_replace("^project[ _-]*", "") %>%
-    stringr::str_replace("^p[ _-]*", "")
-
-  x_num <- suppressWarnings(as.numeric(x_norm))
-  out <- suppressWarnings(as.integer(x_num))
-  out[is.na(x_num) | x_num != out | !(out %in% 2:9)] <- NA_integer_
   out
 }
 

@@ -8,6 +8,9 @@
 # optionally removes low-loading items flagged by analyze_backbone_scales.R,
 # computes score_* columns plus FHS family-history outputs, and writes scored
 # masters without dropping participants who have no FHS response.
+# Also exports fixed CAPE positive frequency subfactor sums and means from
+# Schlier et al. (2015), Table 2, alongside the original CAPE scores.
+# Run the updated Step 03 first to regenerate matching keys.
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 rm(list = ls())
@@ -285,6 +288,25 @@ safe_score_name <- function(x) {
     stringr::str_replace_all("^_+|_+$", "")
 }
 
+is_cape_positive_schlier2015_subscale <- function(scale, subscale) {
+  !is.na(scale) & toupper(trimws(as.character(scale))) == "CAPE" &
+    !is.na(subscale) & startsWith(tolower(trimws(as.character(subscale))),
+                                 "positive_schlier2015_")
+}
+
+validate_cape_positive_schlier2015_keys <- function(keys) {
+  subs <- keys$items_by_subscale
+  if (is.null(subs) || !nrow(subs) ||
+      !any(toupper(trimws(subs$scale)) == "CAPE", na.rm = TRUE)) return(invisible(TRUE))
+  meta <- keys$cape_positive_schlier2015
+  extra <- subs[is_cape_positive_schlier2015_subscale(subs$scale, subs$subscale), , drop = FALSE]
+  if (is.null(meta) || is.null(meta$factors) || nrow(extra) != 5L ||
+      !setequal(extra$subscale, meta$factors$subscale)) {
+    stop("CAPE Schlier2015 keys are missing or incomplete. Rerun the updated Step 03 before Step 05.")
+  }
+  invisible(TRUE)
+}
+
 make_threshold_tag <- function(x) {
   paste0("lt", gsub("\\.", "", formatC(x, format = "f", digits = 2)))
 }
@@ -388,6 +410,10 @@ drop_flagged_items_from_keys <- function(keys, flagged_tbl) {
   
   remove_flagged <- function(items, level, scale, subscale = NA_character_) {
     items <- as.character(items)
+    # Literature-defined factors retain their complete Table 2 membership in
+    # every output variant. Filtering still applies to the original CAPE scores.
+    if (identical(level, "subscale") &&
+        is_cape_positive_schlier2015_subscale(scale, subscale)) return(items)
     
     relevant_flags <- flags %>%
       dplyr::filter(
@@ -495,6 +521,37 @@ score_items_wide <- function(d, items, col_map, agg = c("mean","sum")) {
   out <- if (agg == "sum") rowSums(M, na.rm = TRUE) else rowMeans(M, na.rm = TRUE)
   out[n_nonmiss == 0] <- NA_real_
   out
+}
+
+score_cape_positive_schlier2015_wide <- function(d, items, col_map, subscale, metadata) {
+  definition <- metadata$factors[metadata$factors$subscale == subscale, , drop = FALSE]
+  nums <- suppressWarnings(as.integer(stringr::str_extract(as.character(items), "[0-9]+$")))
+  if (nrow(definition) != 1L || length(items) != definition$n_items[1] ||
+      anyNA(nums) || anyDuplicated(nums) ||
+      !setequal(nums, unlist(definition$item_numbers[[1]], use.names = FALSE)) ||
+      !setequal(normalize_id_local(items), normalize_id_local(definition$items[[1]]))) {
+    stop("CAPE Schlier2015 item membership differs from Table 2 for '", subscale, "'.")
+  }
+
+  cols <- col_map$orig[match(normalize_id_local(items), col_map$item_norm)]
+  if (anyNA(cols)) {
+    stop("CAPE Schlier2015 frequency item columns missing from the clean master: ",
+         paste(items[is.na(cols)], collapse = ", "))
+  }
+  # Frequency only. Never mix frequency with distress or replace structural
+  # distress zeros. Original item columns and CAPE scores keep their 1-4 coding.
+  M <- d[, cols, drop = FALSE]
+  M[] <- lapply(M, function(x) suppressWarnings(as.numeric(as.character(x))))
+  values <- as.matrix(M)
+  if (any(!is.na(values) & (!is.finite(values) |
+                           values < metadata$clean_frequency_min |
+                           values > metadata$clean_frequency_max))) {
+    stop("CAPE Schlier2015 expects cleaned frequency items coded 1-4. Check Step 03 for '", subscale, "'.")
+  }
+  values <- values - metadata$clean_frequency_min + metadata$item_score_min
+  # Require every factor item. Step 03 already handles missing items globally;
+  # do not silently produce a partial sum when a required response is missing.
+  list(sum = rowSums(values), mean = rowMeans(values))
 }
 
 # CTQ-SF items 10, 16 and 22 form a separate 0-3 Minimization/Denial
@@ -877,6 +934,17 @@ add_subscale_scores <- function(df, keys, scoring_df,
       next
     }    
     new_col <- paste0(prefix, safe_score_name(sc), "__", safe_score_name(sub))
+
+    if (is_cape_positive_schlier2015_subscale(sc, sub)) {
+      extra <- score_cape_positive_schlier2015_wide(
+        df, items, col_map, sub, keys$cape_positive_schlier2015
+      )
+      df[[paste0(new_col, "_sum")]] <- extra$sum
+      df[[paste0(new_col, "_mean")]] <- extra$mean
+      log_msg("Scored fixed CAPE Schlier2015 factor '", sub,
+              "' (frequency only; 0-3 item coding; sum + mean; ", length(items), " items)")
+      next
+    }
     
     if (toupper(trimws(sc)) == "SUQ") {
       if (!can_score_suq_subscale_wide(items, col_map)) {
@@ -1364,6 +1432,7 @@ process_sample <- function(sample, scoring_df, flag_helper_path = NA_character_)
 
   df   <- read_master_robust(master_path)
   keys <- readRDS(keys_path)
+  validate_cape_positive_schlier2015_keys(keys)
   ctq_md_definition <- get_ctq_md_definition(keys)
 
   # FHS remains outside the internal-consistency/item-loading workflow, but its

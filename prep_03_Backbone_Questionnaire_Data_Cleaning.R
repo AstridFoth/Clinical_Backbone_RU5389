@@ -7,6 +7,17 @@
 # Reads questionnaire data, filters bad rows, reverse-codes items, applies
 # questionnaire-specific item-level preprocessing, enriches demographics/health,
 # writes item-level clean masters, per-project exports, sanity logs, and keys.
+# Per-project clean files go to 01_project_data/<project>_backbone/derivatives/
+# questionnaires; combined masters, keys and logs keep their existing locations.
+# Previous 02_cleaned outputs are archived under 02_cleaned/old as before.
+# Adds fixed, frequency-only CAPE positive subfactor keys from Schlier et al.
+# (2015), Table 2, alongside the existing CAPE keys. Run steps 03 -> 04 -> 05.
+# Grouping revision 2026-10-09: group labels With_Diagnosis / No_Diagnosis,
+# plus Diagnosis_Group in all clean and discarded exports. Fixed groups for
+# With_Diagnosis participants: P2 psychosis; P8 anxiety; P9 obsession.
+# Run Tool_01_P7_diagnosis_extraction.R first to refresh the P7 grouping sheet.
+# Revision 2026-10-12: all P3/P4/P5 participants are forced to No_Diagnosis,
+# with an empty Diagnosis_Group, independently of grouping-workbook entries.
 #
 # IMPORTANT:
 # - This script does NOT compute score_* columns.
@@ -47,8 +58,9 @@ script_dir <- function() {
 
 ROOT <- script_dir()
 
+DIR_PROJECT_DATA    <- fs::path(ROOT, "01_project_data")
 DIR_QUESTIONNAIRES  <- fs::path(
-  ROOT, "01_project_data", "all_projects_backbone", "raw_data", "questionnaires"
+  DIR_PROJECT_DATA, "all_projects_backbone", "raw_data", "questionnaires"
 )
 DIR_INFO            <- fs::path(ROOT, "information")
 DIR_EXPORT          <- fs::path(ROOT, "02_cleaned")
@@ -265,165 +277,205 @@ read_scoring <- function(filepath) {
 }
 
 # ---- Groupings helpers -------------------------------------------------------
+# Revision 2026-10-09: With_Diagnosis / No_Diagnosis and Diagnosis_Group.
+# In list-style grouping sheets, Diagnosis_Group is aligned ONLY with the
+# With_Diagnosis ID on that row. The No_Diagnosis list is independent.
+standardize_group <- function(x) {
+  x0 <- gsub("[^a-z0-9]", "", tolower(trimws(as.character(x))))
+  dplyr::case_when(
+    x0 %in% c("withdiagnosis", "patient", "patients", "pt", "case", "clinical") ~ "With_Diagnosis",
+    x0 %in% c("nodiagnosis", "hc", "healthy", "control", "controls", "healthycontrol") ~ "No_Diagnosis",
+    TRUE ~ NA_character_
+  )
+}
+
+normalize_diagnosis_group <- function(x) {
+  x <- trimws(as.character(x))
+  x[is.na(x) | x == ""] <- NA_character_
+  token <- gsub("[^a-z]", "", tolower(x))
+  labels <- c("psychosis", "anxiety", "obsession", "depression", "substance", "ptsd", "rest")
+  for (label in labels) {
+    x[token %in% c(label, paste0(label, "group"))] <- paste0(label, "-group")
+  }
+  x
+}
+
+apply_project_diagnosis_groups <- function(df, project_keys) {
+  if (!"group" %in% names(df)) df$group <- rep(NA_character_, nrow(df))
+  if (!"Diagnosis_Group" %in% names(df)) df$Diagnosis_Group <- rep(NA_character_, nrow(df))
+  df$group <- standardize_group(df$group)
+  # Psychiatric diagnoses were exclusion criteria in screened projects 3, 4 and 5.
+  # Force every participant to No_Diagnosis, including unmatched or missing IDs.
+  screened_no_diagnosis <- project_keys %in% c("p3", "p4", "p5")
+  df$group[screened_no_diagnosis] <- "No_Diagnosis"
+  df$Diagnosis_Group <- normalize_diagnosis_group(df$Diagnosis_Group)
+  with_diagnosis <- !is.na(df$group) & df$group == "With_Diagnosis"
+  df$Diagnosis_Group[!with_diagnosis] <- NA_character_
+  df$Diagnosis_Group[with_diagnosis & project_keys %in% "p2"] <- "psychosis-group"
+  df$Diagnosis_Group[with_diagnosis & project_keys %in% "p8"] <- "anxiety-group"
+  df$Diagnosis_Group[with_diagnosis & project_keys %in% "p9"] <- "obsession-group"
+  df
+}
+
 read_groupings_for_sample <- function(sample, filepath = NULL) {
-  if (is.null(filepath)) filepath <- latest_groupings_file()
+  # Tool_01 updates this exact workbook; use it even if another dated copy
+  # exists in private_information.
+  if (is.null(filepath)) filepath <- fs::path(DIR_PRIVATE, "2025-10-15_groupings.xlsx")
   if (is.null(filepath) || is.na(filepath) || !fs::file_exists(filepath)) {
     log_msg("No groupings file found — skipping group mapping for sample '", sample, "'.")
     return(NULL)
   }
   log_msg("Reading groupings workbook: ", filepath)
-  
   sheets <- readxl::excel_sheets(filepath)
-  
   parsed <- purrr::map_dfr(sheets, function(sh) {
-    sh_l <- tolower(sh)
-    m <- stringr::str_match(sh_l, "^\\s*(p?\\s*(\\d+))\\s*([\\s_-].*)?$")
+    m <- stringr::str_match(tolower(sh), "^\\s*(p?\\s*(\\d+))\\s*([\\s_-].*)?$")
     if (all(is.na(m))) return(NULL)
-    num <- m[,3]
-    suf <- m[,4]
     tibble::tibble(
-      sheet = sh,
-      .p_join = paste0("p", num),
-      suffix_norm = norm_token(ifelse(is.na(suf), "", suf))
+      sheet = sh, .p_join = paste0("p", m[, 3]),
+      suffix_norm = norm_token(ifelse(is.na(m[, 4]), "", m[, 4]))
     )
   })
-  
   if (!nrow(parsed)) {
     log_msg("Groupings workbook has no 'p#' sheets — skipping.")
     return(NULL)
   }
-  
   sample_norm <- norm_token(sample)
   parsed <- parsed %>%
-    dplyr::mutate(
-      score = dplyr::case_when(
-        suffix_norm == "" ~ 1L,
-        grepl(sample_norm, suffix_norm, fixed = TRUE) ~ 2L,
-        TRUE ~ 0L
-      )
-    )
-  
-  id_candidates    <- c("vp","vp id","vpid","vp_id","vp-id","participant","participant id",
-                        "participant_id","participantid","subject","subject id","subject_id","vpid_clean")
-  group_candidates <- c("group","grp","status","diagnosis","dx","health_status","arm")
-  
-  standardize_group <- function(x) {
-    x0 <- x %>% as.character() %>% stringr::str_trim() %>% stringr::str_to_lower()
-    dplyr::case_when(
-      x0 %in% c("hc","healthy","control","healthy control","healthy_control","healthy-control","controls") ~ "HC",
-      x0 %in% c("patient","pt","case","clinical","patients") ~ "patient",
-      TRUE ~ NA_character_
-    )
-  }
-  
+    dplyr::mutate(score = dplyr::case_when(
+      suffix_norm == "" ~ 1L,
+      grepl(sample_norm, suffix_norm, fixed = TRUE) ~ 2L,
+      TRUE ~ 0L
+    )) %>%
+    dplyr::filter(.data$score > 0L)
+  id_candidates <- c("vp", "vp id", "vpid", "vp_id", "vp-id", "participant", "participant id",
+                     "participant_id", "participantid", "subject", "subject id", "subject_id", "vpid_clean", "id")
+  group_candidates <- c("group", "grp", "status", "diagnosis", "dx", "health_status", "arm")
   all_rows <- purrr::map_dfr(parsed$sheet, function(sh) {
     meta <- parsed[parsed$sheet == sh, , drop = FALSE]
     df_sh <- suppressMessages(readxl::read_excel(filepath, sheet = sh)) %>% janitor::clean_names()
-    
-    id_col  <- intersect(names(df_sh), janitor::make_clean_names(id_candidates)) |> purrr::pluck(1, .default = NA_character_)
-    grp_col <- intersect(names(df_sh), janitor::make_clean_names(group_candidates)) |> purrr::pluck(1, .default = NA_character_)
-    
-    if (!is.na(id_col) && !is.na(grp_col)) {
-      return(
-        df_sh %>%
-          dplyr::transmute(
-            .p_join = meta$.p_join[1],
-            vp_join = normalize_vpid(.data[[id_col]]),
-            group   = standardize_group(.data[[grp_col]]),
-            .score  = meta$score[1]
-          ) %>%
-          dplyr::filter(!is.na(vp_join) & !is.na(group))
+    dx_col <- intersect("diagnosis_group", names(df_sh)) |> purrr::pluck(1, .default = NA_character_)
+    dx <- if (!is.na(dx_col)) normalize_diagnosis_group(df_sh[[dx_col]]) else rep(NA_character_, nrow(df_sh))
+    # Prefer the new names; keep legacy input names readable during migration.
+    with_col <- intersect(c("with_diagnosis", "patient", "patients"), names(df_sh)) |>
+      purrr::pluck(1, .default = NA_character_)
+    no_col <- intersect(c("no_diagnosis", "control", "controls", "hc"), names(df_sh)) |>
+      purrr::pluck(1, .default = NA_character_)
+    if (!is.na(with_col) || !is.na(no_col)) {
+      rows_with <- if (!is.na(with_col)) tibble::tibble(
+        vp_join = normalize_vpid(df_sh[[with_col]]), group = "With_Diagnosis", Diagnosis_Group = dx
+      ) else tibble::tibble()
+      rows_no <- if (!is.na(no_col)) tibble::tibble(
+        vp_join = normalize_vpid(df_sh[[no_col]]), group = "No_Diagnosis", Diagnosis_Group = NA_character_
+      ) else tibble::tibble()
+      out <- dplyr::bind_rows(rows_with, rows_no)
+    } else {
+      id_col <- intersect(names(df_sh), janitor::make_clean_names(id_candidates)) |>
+        purrr::pluck(1, .default = NA_character_)
+      grp_col <- intersect(names(df_sh), janitor::make_clean_names(group_candidates)) |>
+        purrr::pluck(1, .default = NA_character_)
+      if (is.na(id_col) || is.na(grp_col)) {
+        log_msg("Sheet '", sh, "' has no recognizable ID/group or With_Diagnosis/No_Diagnosis columns — skipped.")
+        return(NULL)
+      }
+      out <- tibble::tibble(
+        vp_join = normalize_vpid(df_sh[[id_col]]),
+        group = standardize_group(df_sh[[grp_col]]), Diagnosis_Group = dx
       )
     }
-    
-    pat_col <- intersect(names(df_sh), c("patient","patients")) |> purrr::pluck(1, .default = NA_character_)
-    ctr_col <- intersect(names(df_sh), c("control","controls","hc")) |> purrr::pluck(1, .default = NA_character_)
-    if (!is.na(pat_col) || !is.na(ctr_col)) {
-      rows_pat <- if (!is.na(pat_col)) tibble::tibble(vp_join = normalize_vpid(df_sh[[pat_col]]), group = "patient") else tibble::tibble()
-      rows_ctr <- if (!is.na(ctr_col)) tibble::tibble(vp_join = normalize_vpid(df_sh[[ctr_col]]), group = "HC") else tibble::tibble()
-      bind <- dplyr::bind_rows(rows_pat, rows_ctr) %>%
-        dplyr::filter(!is.na(vp_join) & vp_join != "")
-      if (nrow(bind)) {
-        bind$.p_join <- meta$.p_join[1]
-        bind$.score  <- meta$score[1]
-      }
-      return(bind)
-    }
-    
-    log_msg("Sheet '", sh, "' has no recognizable ID/group nor Patient/Control columns — skipped.")
-    NULL
+    out <- out %>% dplyr::filter(!is.na(vp_join) & vp_join != "" & !is.na(group))
+    out$.p_join <- rep(meta$.p_join[1], nrow(out))
+    out$.score <- rep(meta$score[1], nrow(out))
+    out
   })
-  
   if (!nrow(all_rows)) {
     log_msg("Groupings for '", sample, "' contained no usable rows after cleaning.")
     return(NULL)
   }
-  
-  out <- all_rows %>%
-    dplyr::arrange(dplyr::desc(.score)) %>%
+  # A sample-specific sheet takes precedence over a generic project sheet.
+  best_rows <- all_rows %>%
+    dplyr::group_by(.p_join, vp_join) %>%
+    dplyr::filter(.score == max(.score)) %>%
+    dplyr::ungroup()
+  best_rows <- apply_project_diagnosis_groups(best_rows, best_rows$.p_join)
+  conflicts <- best_rows %>%
+    dplyr::group_by(.p_join, vp_join) %>%
+    dplyr::summarise(
+      status_count = dplyr::n_distinct(group),
+      diagnosis_count = dplyr::n_distinct(Diagnosis_Group, na.rm = TRUE), .groups = "drop"
+    ) %>%
+    dplyr::filter(status_count > 1L | diagnosis_count > 1L)
+  if (nrow(conflicts)) stop(
+    "Conflicting grouping entries for project/ID: ",
+    paste(paste(conflicts$.p_join, conflicts$vp_join, sep = "/"), collapse = ", "),
+    ". Resolve these entries in the grouping workbook before exporting."
+  )
+  out <- best_rows %>%
+    dplyr::arrange(dplyr::desc(!is.na(Diagnosis_Group))) %>%
     dplyr::distinct(.p_join, vp_join, .keep_all = TRUE) %>%
-    dplyr::select(.p_join, vp_join, group)
-  
+    dplyr::select(.p_join, vp_join, group, Diagnosis_Group)
   log_msg("Loaded ", nrow(out), " group mappings for sample '", sample, "'.")
   out
 }
 
 attach_groupings <- function(df, sample,
-                             id_guess = c("vp","vp id","vpid","vp_id","vp-id",
-                                          "participant","participant id","participant_id","participantid",
-                                          "subject","subject_id","subject id")) {
+                             id_guess = c("vp", "vp id", "vpid", "vp_id", "vp-id",
+                                          "participant", "participant id", "participant_id", "participantid",
+                                          "subject", "subject_id", "subject id", "vpid_clean"),
+                             groupings = read_groupings_for_sample(sample)) {
+  if (!"group" %in% names(df)) df$group <- rep(NA_character_, nrow(df))
+  if (!"Diagnosis_Group" %in% names(df)) {
+    df$Diagnosis_Group <- if ("diagnosis_group" %in% names(df)) {
+      as.character(df$diagnosis_group)
+    } else rep(NA_character_, nrow(df))
+  }
+  df <- dplyr::select(df, -dplyr::any_of("diagnosis_group"))
   proj_col <- get_project_col(df)
   if (is.null(proj_col)) {
-    log_msg("No project column ('project' or 'p') in data — cannot attach groupings. Returning original df.")
-    if (!"group" %in% names(df)) df$group <- NA_character_
-    return(df)
+    log_msg("No project column ('project' or 'p') — group mapping cannot be attached.")
+    return(apply_project_diagnosis_groups(df, rep(NA_character_, nrow(df))))
   }
-  
-  grp <- read_groupings_for_sample(sample)
-  if (is.null(grp)) {
-    if (!"group" %in% names(df)) df$group <- NA_character_
-    return(df)
-  }
-  
-  df$.p_join <- normalize_project_key(df[[proj_col]])
-  
+  project_keys <- normalize_project_key(df[[proj_col]])
+  if (!nrow(df) || is.null(groupings)) return(apply_project_diagnosis_groups(df, project_keys))
+  df$.p_join <- project_keys
+  grp <- groupings %>% dplyr::rename(
+    .mapped_group = group, .mapped_diagnosis_group = Diagnosis_Group
+  )
   df_nms_norm <- gsub("[^a-z0-9]+", "", tolower(names(df)))
-  cand_norm   <- gsub("[^a-z0-9]+", "", tolower(id_guess))
-  id_in_df    <- names(df)[df_nms_norm %in% cand_norm]
-  
-  best <- NULL; best_n <- -1; best_id <- NA_character_
-  
+  cand_norm <- gsub("[^a-z0-9]+", "", tolower(id_guess))
+  id_in_df <- names(df)[df_nms_norm %in% cand_norm]
+  best <- NULL
+  best_n <- -1L
+  best_id <- NA_character_
   for (id_col in id_in_df) {
     tmp <- df %>%
       dplyr::mutate(.vp_join = normalize_vpid(.data[[id_col]])) %>%
       dplyr::left_join(grp, by = c(".p_join", ".vp_join" = "vp_join"))
-    nmatch <- sum(!is.na(tmp$group))
+    nmatch <- sum(!is.na(tmp$.mapped_group))
     if (nmatch > best_n) {
       best <- tmp
       best_n <- nmatch
       best_id <- id_col
     }
   }
-  
-  df_out <- if (!is.null(best)) {
-    best
+  # Assign by project + participant ID only. A project-only fallback would
+  # misclassify unmatched IDs and could duplicate rows when a project has both
+  # With_Diagnosis and No_Diagnosis participants.
+  if (is.null(best)) {
+    df_out <- df
+    matched <- 0L
+    log_msg("No recognizable participant ID column for sample '", sample, "'; workbook mappings were not assigned.")
   } else {
-    df %>% dplyr::left_join(grp %>% dplyr::distinct(.p_join, group), by = ".p_join")
+    matched <- sum(!is.na(best$.mapped_group))
+    df_out <- best %>% dplyr::mutate(
+      group = dplyr::coalesce(.mapped_group, standardize_group(group)),
+      Diagnosis_Group = ifelse(!is.na(.mapped_group), .mapped_diagnosis_group, Diagnosis_Group)
+    )
   }
-  
-  if (!"group" %in% names(df_out) || all(is.na(df_out$group))) {
-    df_out <- df_out %>%
-      dplyr::left_join(grp %>% dplyr::distinct(.p_join, group), by = ".p_join")
-  }
-  
-  if (!"group" %in% names(df_out)) df_out$group <- NA_character_
-  df_out <- df_out %>%
-    dplyr::mutate(group = as.character(.data$group)) %>%
-    dplyr::select(-dplyr::any_of(c(".p_join", ".vp_join")))
-  
-  matched <- sum(!is.na(df_out$group))
-  log_msg(glue::glue("Grouping for '{sample}': matched {matched}/{nrow(df_out)} rows ",
-                     if (!is.na(best_id)) glue::glue("(via '{best_id}')") else "(project-only)"))
+  df_out <- apply_project_diagnosis_groups(df_out, df_out$.p_join) %>%
+    dplyr::select(-dplyr::any_of(c(".p_join", ".vp_join", ".mapped_group", ".mapped_diagnosis_group")))
+  stopifnot(nrow(df_out) == nrow(df))
+  log_msg(glue::glue("Grouping for '{sample}': matched {matched}/{nrow(df_out)} rows",
+                    if (!is.na(best_id)) glue::glue(" (via '{best_id}')") else ""))
   df_out
 }
 
@@ -458,6 +510,93 @@ check_header_match <- function(q_df, item_info) {
     log_msg("Header check: questionnaire columns align with Item Information (filtered to scored scales).")
   }
   invisible(TRUE)
+}
+
+# ---- Additional CAPE positive factors: Schlier et al. (2015) ------------------
+# Source: Schizophrenia Research 169, 274-279, Table 2 (p. 276).
+# DOI: 10.1016/j.schres.2015.10.034
+# These are the five POSITIVE first-order factors of the nine-factor model.
+# The paper analyses frequency (0-3), not distress. The Backbone asks about the
+# last four weeks, whereas the validation paper used lifetime frequency.
+# Keep the existing CAPE frequency/distress keys and item preprocessing intact.
+CAPE_POSITIVE_SCHLIER2015_ITEMS <- list(
+  bizarre_experiences = c(5L, 17L, 24L, 26L, 28L, 30L, 31L),
+  hallucinations = c(33L, 34L, 41L, 42L),
+  paranoia = c(2L, 6L, 7L, 10L, 22L),
+  grandiosity = c(11L, 13L),
+  magical_thinking = c(15L, 20L)
+)
+
+add_cape_positive_schlier2015_keys <- function(keys) {
+  subs <- keys$items_by_subscale
+  is_cape <- !is.na(subs$scale) & toupper(trimws(subs$scale)) == "CAPE"
+  if (!any(is_cape)) return(keys)
+
+  freq_rows <- subs[is_cape & !is.na(subs$subscale) &
+                      tolower(trimws(subs$subscale)) == "frequency", , drop = FALSE]
+  freq_items <- unique(as.character(unlist(freq_rows$items, use.names = FALSE)))
+  freq_numbers <- suppressWarnings(as.integer(stringr::str_extract(freq_items, "[0-9]+$")))
+  expected <- unlist(CAPE_POSITIVE_SCHLIER2015_ITEMS, use.names = FALSE)
+  if (anyNA(freq_numbers) || anyDuplicated(freq_numbers) ||
+      !all(expected %in% freq_numbers)) {
+    stop(
+      "CAPE positive Schlier2015 keys need unambiguous frequency items for all ",
+      "20 positive CAPE-42 item numbers. Missing numbers: ",
+      paste(setdiff(expected, freq_numbers), collapse = ", "),
+      ". Check the CAPE frequency rows in Item Information."
+    )
+  }
+
+  extra <- tibble::tibble(
+    scale = "CAPE",
+    subscale = paste0("positive_schlier2015_", names(CAPE_POSITIVE_SCHLIER2015_ITEMS)),
+    items = unname(lapply(CAPE_POSITIVE_SCHLIER2015_ITEMS, function(nums) {
+      freq_items[match(nums, freq_numbers)]
+    }))
+  )
+  keys$items_by_subscale <- dplyr::bind_rows(subs, extra)
+
+  # Keep the flat, higher-order and nested key representations consistent.
+  ho_label <- "CAPE_positive_Schlier2015"
+  keys$items_by_higher_order <- dplyr::bind_rows(
+    keys$items_by_higher_order,
+    tibble::tibble(
+      higher_order_subscale = ho_label,
+      items = list(unique(unlist(extra$items, use.names = FALSE)))
+    )
+  )
+  cape_idx <- which(toupper(trimws(keys$nested$scale)) == "CAPE")
+  if (length(cape_idx) == 1L) {
+    keys$nested$higher_order[[cape_idx]] <- dplyr::bind_rows(
+      keys$nested$higher_order[[cape_idx]],
+      tibble::tibble(
+        higher_order_subscale = ho_label,
+        subscales = list(dplyr::select(extra, subscale, items))
+      )
+    )
+  }
+
+  # Step 03 retains its existing 1-4 frequency coding. Step 05 subtracts one
+  # only for these additional indices, then exports both unweighted sums and
+  # item means on the paper's 0-3 metric. No CFA weights or cutoffs are inferred.
+  keys$cape_positive_schlier2015 <- list(
+    reference = "Schlier et al. (2015), doi:10.1016/j.schres.2015.10.034, Table 2",
+    response_dimension = "frequency",
+    clean_frequency_min = 1,
+    clean_frequency_max = 4,
+    item_score_min = 0,
+    item_score_max = 3,
+    paper_timeframe = "lifetime",
+    backbone_timeframe = "last four weeks",
+    factors = tibble::tibble(
+      subscale = extra$subscale,
+      n_items = lengths(CAPE_POSITIVE_SCHLIER2015_ITEMS),
+      item_numbers = unname(CAPE_POSITIVE_SCHLIER2015_ITEMS),
+      items = extra$items
+    )
+  )
+  log_msg("Added five fixed CAPE positive frequency subfactor keys (Schlier2015; 7/4/5/2/2 items).")
+  keys
 }
 
 build_keys <- function(item_info) {
@@ -501,12 +640,13 @@ build_keys <- function(item_info) {
       .groups = "drop"
     )
   
-  list(
+  keys <- list(
     items_by_scale = items_by_scale,
     items_by_subscale = items_by_sub,
     items_by_higher_order = items_by_ho,
     nested = nested
   )
+  add_cape_positive_schlier2015_keys(keys)
 }
 
 # ---- Row filtering -----------------------------------------------------------
@@ -1167,12 +1307,25 @@ export_per_project <- function(df_clean,
   
   df_split <- split(df_clean, df_clean[[proj_col]])
   purrr::iwalk(df_split, function(dd, proj) {
+    project_key <- normalize_project_key(proj)
+    if (is.na(project_key) || !grepl("^p[0-9]+$", project_key)) {
+      warning("Cannot assign project-specific export to a project folder: ", proj,
+              ". These rows remain in the combined clean master.", call. = FALSE)
+      return(invisible(NULL))
+    }
+    project_number <- sub("^p", "", project_key)
+    project_out_dir <- fs::path(
+      DIR_PROJECT_DATA, paste0(project_number, "_backbone"),
+      "derivatives", "questionnaires"
+    )
+    fs::dir_create(project_out_dir)
     safe_proj <- gsub("[^A-Za-z0-9_-]+", "_", proj)
     filepath <- fs::path(
-      out_dir,
+      project_out_dir,
       glue::glue("{input_date}_{sample}_project-{safe_proj}_clean.xlsx")
     )
     writexl::write_xlsx(dd, filepath)
+    log_msg("Wrote project-specific clean questionnaire file: ", filepath)
   })
   
   log_msg(glue::glue("Exported {length(df_split)} per-project XLSX files for '{sample}'."))
@@ -1587,7 +1740,9 @@ process_sample <- function(sample,
   }
   q_final <- q_final %>% dplyr::select(dplyr::any_of(id_cols), dplyr::everything())
   q_final <- clean_duplicate_parent_gender(q_final, sample)
-  q_final <- attach_groupings(q_final, sample)
+  grouping_map <- read_groupings_for_sample(sample)
+  q_final <- attach_groupings(q_final, sample, groupings = grouping_map)
+  q_discard <- attach_groupings(q_discard, sample, groupings = grouping_map)
   
   q_ready <- enrich_demographics_and_health_fields(q_final, sample)
 

@@ -1,6 +1,6 @@
 # RU5389 cognitive scoring: exploratory quality assessment (BACS, WCST, LNS)
-# Place beside prep_03_Cognitive_Scoring_pipeline.R and run AFTER that script.
-# Reads every project-specific and ALL cognitive_scores workbook independently.
+# Run AFTER prep_03_Cognitive_Scoring_pipeline.R; script subfolders are supported.
+# Reads the latest project-specific and ALL cognitive_scores workbooks independently.
 # It does not change scores, exclude participants, or rewrite pipeline outputs.
 
 required_packages <- c("readxl", "writexl", "ggplot2")
@@ -11,29 +11,92 @@ if (length(missing_packages)) {
   stop("Install missing R packages: ", paste(missing_packages, collapse = ", "))
 }
 
+# Resolve the data repository independently of the script's own subfolder.
+# BACKBONE_ROOT can override the established K: drive location.
 script_directory <- function() {
-  args <- commandArgs(trailingOnly = FALSE)
-  script_arg <- grep("^--file=", args, value = TRUE)
-  if (length(script_arg)) return(dirname(normalizePath(sub("^--file=", "", script_arg[1]), mustWork = FALSE)))
-  if (requireNamespace("rstudioapi", quietly = TRUE) && rstudioapi::isAvailable()) {
-    active <- rstudioapi::getSourceEditorContext()$path
-    if (length(active) && !is.na(active) && nzchar(active)) return(dirname(normalizePath(active, mustWork = FALSE)))
+  source_files <- vapply(sys.frames(), function(frame) {
+    p <- frame$ofile
+    if (is.null(p) || !length(p) || is.na(p[1])) "" else as.character(p[1])
+  }, character(1))
+  source_files <- source_files[nzchar(source_files)]
+  if (length(source_files)) {
+    return(dirname(normalizePath(tail(source_files, 1), winslash = "/", mustWork = FALSE)))
   }
-  normalizePath(getwd(), mustWork = FALSE)
+  file_arg <- grep("^--file=", commandArgs(trailingOnly = FALSE), value = TRUE)
+  if (length(file_arg)) {
+    return(dirname(normalizePath(sub("^--file=", "", file_arg[1]), winslash = "/", mustWork = FALSE)))
+  }
+  if (requireNamespace("rstudioapi", quietly = TRUE) && rstudioapi::isAvailable()) {
+    p <- tryCatch(rstudioapi::getSourceEditorContext()$path, error = function(e) "")
+    if (length(p) == 1L && !is.na(p) && nzchar(p)) {
+      return(dirname(normalizePath(p, winslash = "/", mustWork = FALSE)))
+    }
+  }
+  normalizePath(getwd(), winslash = "/", mustWork = FALSE)
 }
 
-script_dir <- script_directory()
-input_root <- file.path(script_dir, "01_project_data")
-output_root <- Sys.getenv(
-  "COGNITIVE_QC_OUTPUT_DIR",
-  unset = "K:/Wilken_Arbeitsordner/Clinical_Backbone_RU5389/out/cognitive_tests"
-)
+resolve_backbone_root <- function(start = script_directory()) {
+  override <- Sys.getenv("BACKBONE_ROOT", unset = "")
+  if (nzchar(override)) {
+    if (!dir.exists(override)) stop("BACKBONE_ROOT does not exist: ", override)
+    return(normalizePath(override, winslash = "/", mustWork = TRUE))
+  }
+  for (location in unique(c(start, getwd()))) {
+    location <- normalizePath(location, winslash = "/", mustWork = FALSE)
+    repeat {
+      if (dir.exists(file.path(location, "01_project_data")) &&
+          any(dir.exists(file.path(location, c("02_cleaned", "03_analysis_input"))))) {
+        return(location)
+      }
+      parent <- dirname(location)
+      if (identical(parent, location)) break
+      location <- parent
+    }
+  }
+  default_root <- "K:/Wilken_Arbeitsordner/Clinical_Backbone_RU5389"
+  if (dir.exists(default_root)) return(default_root)
+  stop("Cannot locate Clinical_Backbone_RU5389. Set BACKBONE_ROOT to its root folder.")
+}
+
+input_date_from_path <- function(paths) {
+  vapply(paths, function(path) {
+    hit <- regexpr("[0-9]{4}-[0-9]{2}-[0-9]{2}", basename(path))
+    if (hit[1] < 0L) return(NA_character_)
+    stamp <- regmatches(basename(path), hit)
+    parsed <- suppressWarnings(as.Date(stamp, format = "%Y-%m-%d"))
+    if (is.na(parsed) || format(parsed, "%Y-%m-%d") != stamp) NA_character_ else stamp
+  }, character(1), USE.NAMES = FALSE)
+}
+
+latest_dated_file <- function(directory, pattern, input_date = "") {
+  files <- list.files(directory, pattern = pattern, full.names = TRUE,
+                      recursive = FALSE, ignore.case = TRUE)
+  files <- files[!startsWith(basename(files), "~$")]
+  dates <- input_date_from_path(files)
+  keep <- !is.na(dates)
+  if (nzchar(input_date)) keep <- keep & dates == input_date
+  files <- files[keep]
+  dates <- dates[keep]
+  if (!length(files)) {
+    stop("No matching dated input in ", directory, ": ", pattern,
+         if (nzchar(input_date)) paste0(" (date ", input_date, ")") else "")
+  }
+  newest <- max(dates)
+  hits <- files[dates == newest]
+  if (length(hits) != 1L) stop("Ambiguous input for ", newest, ": ", paste(hits, collapse = "; "))
+  hits[1]
+}
+
+ROOT <- resolve_backbone_root()
+INPUT_DATE <- Sys.getenv("BACKBONE_INPUT_DATE", unset = "")
+input_root <- file.path(ROOT, "01_project_data")
+output_root <- Sys.getenv("COGNITIVE_QC_OUTPUT_DIR", unset = file.path(ROOT, "out", "cognitive_tests"))
 rt_fast_cutoff_ms <- 400
 fast_trial_proportion_flag <- 0.20
 mean_rt_slow_cutoff_ms <- 4000
 stratification_path <- Sys.getenv(
   "COGNITIVE_STRATIFICATION_PATH",
-  unset = "K:/Wilken_Arbeitsordner/Clinical_Backbone_RU5389/03_analysis_input/adults_adolescents_stratification_info.xlsx"
+  unset = file.path(ROOT, "03_analysis_input")
 )
 presentation_scores <- c(
   "score_BACS_correct" = "BACS correct",
@@ -48,53 +111,110 @@ dir.create(output_root, recursive = TRUE, showWarnings = FALSE)
 normalize_path <- function(path) normalizePath(path, winslash = "/", mustWork = FALSE)
 
 extract_date_from_name <- function(x) {
-  match <- regmatches(x, regexpr("[0-9]{4}-[0-9]{2}-[0-9]{2}", x))
-  date <- suppressWarnings(as.Date(match))
-  ifelse(is.na(date), 0, as.numeric(date))
+  dates <- suppressWarnings(as.Date(input_date_from_path(x), format = "%Y-%m-%d"))
+  ifelse(is.na(dates), 0, as.numeric(dates))
 }
+
+first_existing_column <- function(df, candidates) {
+  hits <- match(tolower(candidates), tolower(names(df)))
+  hits <- hits[!is.na(hits)]
+  if (length(hits)) names(df)[hits[1]] else NA_character_
+}
+
+export_filename <- function(path) basename(gsub("\\\\", "/", as.character(path)))
 
 find_file_case_insensitive <- function(directory, filename) {
   if (is.na(directory) || is.na(filename) || !dir.exists(directory)) return(NA_character_)
-  direct <- file.path(directory, basename(filename))
+  filename <- export_filename(filename)
+  direct <- file.path(directory, filename)
   if (file.exists(direct)) return(direct)
   entries <- list.files(directory, full.names = TRUE, recursive = FALSE)
-  hit <- entries[tolower(basename(entries)) == tolower(basename(filename))]
+  hit <- entries[tolower(basename(entries)) == tolower(filename)]
   if (length(hit)) hit[1] else NA_character_
 }
 
-# Use the same raw-file resolution as the scoring pipeline, without adding
-# any provenance column or changing the scoring workbooks.
+# run_info now contains the master basename. Restore its raw_data location
+# from the score workbook's project/experiment structure, without requiring
+# the original overview workbook to read the source filenames in the scores.
+master_for_scores <- function(score_path, scores, info) {
+  relative <- substring(normalize_path(score_path), nchar(normalize_path(input_root)) + 2L)
+  master_name <- if (!is.null(info) && "input_file" %in% names(info) &&
+                    !is.na(info[["input_file"]]) && nzchar(info[["input_file"]])) {
+    export_filename(info[["input_file"]])
+  } else {
+    sub("_cognitive_scores", "_cogtests", basename(score_path), fixed = TRUE)
+  }
+  raw_relative <- sub("/derivatives/", "/raw_data/", relative, fixed = TRUE)
+  legacy_relative <- sub("/derivatives/", "/", relative, fixed = TRUE)
+  candidates <- c(
+    file.path(input_root, dirname(raw_relative), master_name),
+    file.path(input_root, dirname(legacy_relative), master_name)
+  )
+  if (!is.null(info) && "input_file" %in% names(info) &&
+      !is.na(info[["input_file"]]) && file.exists(info[["input_file"]])) {
+    candidates <- c(info[["input_file"]], candidates)
+  }
+  existing <- candidates[file.exists(candidates)]
+  master_path <- if (length(existing)) existing[1] else candidates[1]
+  scope <- sub("_backbone$", "", strsplit(relative, "/", fixed = TRUE)[[1]][1], ignore.case = TRUE)
+  if (tolower(scope) == "all_projects") scope <- "ALL"
+  if (!is.null(info) && "project_scope" %in% names(info) &&
+      !is.na(info[["project_scope"]]) && nzchar(info[["project_scope"]])) {
+    scope <- info[["project_scope"]]
+  }
+  exp_match <- regmatches(basename(score_path), regexpr("exp-[12]", basename(score_path), ignore.case = TRUE))
+  exp_label <- if (length(exp_match) && nzchar(exp_match)) tolower(exp_match) else NA_character_
+  if (!is.null(info) && "experiment_split" %in% names(info) &&
+      !is.na(info[["experiment_split"]]) && nzchar(info[["experiment_split"]])) {
+    exp_label <- tolower(info[["experiment_split"]])
+  }
+  list(
+    path = master_path, scope = toupper(scope), date_stamp = input_date_from_path(score_path),
+    sample = normalize_sample(scores$sample[1]), exp_label = exp_label,
+    pilot = grepl("_PILOT_", basename(score_path), ignore.case = TRUE) ||
+      (!is.null(info) && "pilot" %in% names(info) && identical(tolower(info[["pilot"]]), "true"))
+  )
+}
+
+# Fixed PsyToolkit names: children_parents in overview/score workbooks,
+# children in the raw trial folders. Follow the scoring pipeline's paths.
 candidate_data_directories <- function(master) {
   fallback <- c(
     file.path(input_root, "all_projects_backbone", "raw_data", "experiment_data"),
     file.path(input_root, "all_projects_backbone", "experiment_data")
   )
-  search_roots <- unique(c(dirname(master$path), fallback[file.exists(fallback)]))
-  directories <- unique(unlist(lapply(search_roots, function(x) {
-    list.dirs(x, recursive = TRUE, full.names = TRUE)
+  if (master$sample == "children_parents" && master$scope == "ALL") {
+    fallback <- c(fallback,
+      file.path(input_root, paste0(c("6", "8"), "_backbone"), "raw_data", "experiment_data"),
+      file.path(input_root, paste0(c("6", "8"), "_backbone"), "experiment_data"))
+  }
+  search_roots <- unique(c(dirname(master$path), fallback[dir.exists(fallback)]))
+  search_roots <- search_roots[dir.exists(search_roots)]
+  directories <- unique(unlist(lapply(search_roots, function(directory) {
+    list.dirs(directory, recursive = TRUE, full.names = TRUE)
   }), use.names = FALSE))
+  if (!length(directories)) return(character())
+  data_sample <- if (master$sample == "children_parents") "children" else master$sample
   directories <- directories[grepl("_cogtest_data", basename(directories), ignore.case = TRUE)]
-  directories <- directories[
-    grepl(tolower(paste0("_", master$sample, "_cogtest_data")),
-          tolower(basename(directories)), fixed = TRUE)
-  ]
+  directories <- directories[grepl(paste0("_", data_sample, "_cogtest_data"),
+                                    tolower(basename(directories)), fixed = TRUE)]
+  directories <- directories[!grepl("(^|/)(old|old_data|discarded)(/|$)",
+                                    normalize_path(directories), ignore.case = TRUE)]
   has_exp <- grepl("exp[-_/]?[12]", normalize_path(directories), ignore.case = TRUE)
   if (is.na(master$exp_label)) {
     directories <- directories[!has_exp]
   } else {
     exp_number <- sub("exp-", "", master$exp_label, fixed = TRUE)
-    directories <- directories[
-      grepl(paste0("exp[-_/]?", exp_number, "(?:/|$)"),
-            normalize_path(directories), ignore.case = TRUE, perl = TRUE)
-    ]
+    directories <- directories[grepl(paste0("exp[-_/]?", exp_number, "(?:/|$)"),
+                                     normalize_path(directories), ignore.case = TRUE, perl = TRUE)]
   }
   is_pilot <- grepl("pilot", normalize_path(directories), ignore.case = TRUE)
   directories <- if (master$pilot) directories[is_pilot] else directories[!is_pilot]
   if (!length(directories)) return(character())
-  info <- file.info(directories)
-  order_key <- order(extract_date_from_name(basename(directories)),
-                     as.numeric(info$mtime), decreasing = TRUE, na.last = TRUE)
-  directories[order_key]
+  dates <- input_date_from_path(directories)
+  matching_date <- !is.na(dates) & !is.na(master$date_stamp) & dates == master$date_stamp
+  directories[order(matching_date, extract_date_from_name(basename(directories)),
+                    as.numeric(file.info(directories)$mtime), decreasing = TRUE, na.last = TRUE)]
 }
 
 resolve_trial_path <- function(filename, directories) {
@@ -108,8 +228,7 @@ resolve_trial_path <- function(filename, directories) {
 }
 
 get_run_info <- function(path) {
-  info <- tryCatch(as.data.frame(readxl::read_excel(path, sheet = "run_info")),
-                   error = function(e) NULL)
+  info <- tryCatch(as.data.frame(readxl::read_excel(path, sheet = "run_info")), error = function(e) NULL)
   if (is.null(info) || !all(c("field", "value") %in% names(info))) return(NULL)
   setNames(as.character(info$value), as.character(info$field))
 }
@@ -291,88 +410,107 @@ normalize_project <- function(x) {
   x <- tolower(trimws(as.character(x)))
   x <- gsub("^(project|projekt|p)[ _-]*", "", x)
   x <- sub("_backbone$", "", x)
-  x[x %in% c("", "na", "nan")] <- NA_character_
-  x
+  match <- regexec("^([2-9])(?:$|[ _-])", x, perl = TRUE)
+  parts <- regmatches(x, match)
+  vapply(parts, function(part) if (length(part) >= 2L) part[2] else NA_character_, character(1))
 }
 
 diagnosis_group <- function(x) {
   x <- tolower(trimws(as.character(x)))
   result <- rep("unknown", length(x))
-  hc <- !is.na(x) & grepl("^(hc|healthy[ _-]*control|control|gesund|kontroll)", x)
+  hc <- !is.na(x) & (grepl("^(hc|healthy[ _-]*control|control|gesund|kontroll)", x) |
+    x %in% c("no_diagnosis", "without_diagnosis", "no diagnosis", "without diagnosis"))
   diagnosed <- !is.na(x) & grepl(
     "patient|diagnos|clinical|klinisch|schiz|psychos|psychot|ocd|anxiety|angst|depress|bipolar",
     x
   )
   result[hc] <- "HC"
-  result[diagnosed & !hc] <- "with_diagnosis"
+  result[(diagnosed | x %in% c("pp", "chr", "ar", "at_risk", "pat", "case", "cases")) & !hc] <- "with_diagnosis"
   factor(result, levels = c("HC", "with_diagnosis", "unknown"))
 }
 
 gender_group <- function(x) {
   x <- tolower(trimws(as.character(x)))
   result <- rep(NA_character_, length(x))
-  result[x %in% c("m", "male", "man", "men", "männlich", "mann")] <- "Men"
-  result[x %in% c("f", "female", "woman", "women", "weiblich", "frau")] <- "Women"
+  result[x %in% c("2", "m", "male", "man", "men", "männlich", "mann")] <- "Men"
+  result[x %in% c("1", "f", "female", "woman", "women", "weiblich", "frau")] <- "Women"
   factor(result, levels = c("Men", "Women"))
 }
 
 read_stratification_file <- function(path) {
-  wanted <- c("sample", "vp_id", "project", "age", "gender", "group")
   ext <- tolower(tools::file_ext(path))
   candidates <- tryCatch({
     if (ext %in% c("xlsx", "xls")) {
-      lapply(readxl::excel_sheets(path), function(sheet) readxl::read_excel(path, sheet = sheet))
-    } else if (ext == "rds") {
-      list(readRDS(path))
-    } else if (ext == "tsv") {
-      list(utils::read.delim(path, check.names = FALSE))
-    } else if (ext == "csv") {
-      list(utils::read.csv(path, check.names = FALSE),
-           utils::read.csv2(path, check.names = FALSE))
-    } else list()
+      sheets <- readxl::excel_sheets(path)
+      preferred <- sheets[tolower(sheets) %in% c("strat_all", "combined")]
+      if (length(preferred)) sheets <- preferred[1]
+      lapply(sheets, function(sheet) {
+        data <- as.data.frame(readxl::read_excel(path, sheet = sheet, .name_repair = "minimal"))
+        if (!"sample" %in% tolower(names(data)) && tolower(sheet) %in% c("adults", "adolescents")) {
+          data$sample <- tolower(sheet)
+        }
+        data
+      })
+    } else if (ext == "rds") list(readRDS(path))
+    else if (ext == "tsv") list(utils::read.delim(path, check.names = FALSE))
+    else if (ext == "csv") list(utils::read.csv(path, check.names = FALSE), utils::read.csv2(path, check.names = FALSE))
+    else list()
   }, error = function(e) { warning("Cannot read stratification file ", path, ": ", conditionMessage(e)); list() })
+  parts <- list()
   for (candidate in candidates) {
     if (!is.data.frame(candidate)) next
     names(candidate) <- tolower(trimws(names(candidate)))
-    if (!all(wanted %in% names(candidate))) next
-    result <- as.data.frame(candidate[wanted], stringsAsFactors = FALSE)
-    result$source_file <- path
-    return(result)
+    id_col <- first_existing_column(candidate, c("vp_id", "vp", "vpid", "participant_id", "participantid", "id"))
+    age_col <- first_existing_column(candidate, c("age", "age_years"))
+    if (is.na(id_col) || is.na(age_col) || !all(c("sample", "project", "gender", "group") %in% names(candidate))) next
+    result <- data.frame(
+      sample = as.character(candidate$sample), id = as.character(candidate[[id_col]]),
+      project = as.character(candidate$project), age = as.character(candidate[[age_col]]),
+      gender = as.character(candidate$gender), group = as.character(candidate$group),
+      source_file = path, stringsAsFactors = FALSE
+    )
+    parts[[length(parts) + 1L]] <- result
+    if (ext %in% c("csv", "tsv", "rds")) break
   }
-  warning("No sheet/table with sample, vp_id, project, age, gender, group: ", path)
+  if (length(parts)) return(do.call(rbind, parts))
+  warning("No stratification table with sample, participant ID, project, age, gender, group: ", path)
   NULL
 }
 
 load_stratification <- function(path) {
-  files <- if (dir.exists(path)) {
-    list.files(path, pattern = "\\.(xlsx|xls|csv|tsv|rds)$", recursive = TRUE,
-               full.names = TRUE, ignore.case = TRUE)
-  } else if (file.exists(path)) path else character()
-  files <- files[!startsWith(basename(files), "~$")]
-  if (!length(files)) {
+  if (dir.exists(path)) {
+    # The default is 03_analysis_input: select only its latest stratification
+    # workbook, rather than reading questionnaire exports or archived runs.
+    files <- latest_dated_file(path,
+      "^[0-9]{4}-[0-9]{2}-[0-9]{2}_adults_adolescents_stratification_info\\.xlsx$",
+      input_date = INPUT_DATE)
+  } else if (file.exists(path)) {
+    files <- path
+  } else {
     warning("Stratification info not found: ", path)
     return(NULL)
   }
-  files <- files[order(file.info(files)$mtime, decreasing = TRUE)]
+  message("Reading stratification: ", files)
   parts <- Filter(Negate(is.null), lapply(files, read_stratification_file))
   if (!length(parts)) return(NULL)
   info <- do.call(rbind, parts)
   info$sample <- normalize_sample(info$sample)
-  info$vp_id <- normalize_id(info$vp_id)
+  info$id <- normalize_id(info$id)
   info$project <- normalize_project(info$project)
-  key <- paste(info$sample, info$vp_id, info$project, sep = "|")
+  key <- paste(info$sample, info$id, info$project, sep = "|")
   repeats <- duplicated(key)
   if (any(repeats)) {
-    warning(sum(repeats), " duplicate stratification row(s); newest source file/first row retained")
+    warning(sum(repeats), " duplicate stratification row(s); first source row retained")
     info <- info[!repeats, , drop = FALSE]
   }
   rownames(info) <- NULL
+  attr(info, "source_file") <- files
   info
 }
 
 join_stratification <- function(scores, info) {
   scores$sample <- normalize_sample(scores$sample)
-  scores$vp_id <- normalize_id(scores$score_vp_id)
+  score_ids <- normalize_id(scores$id)
   scores$project <- normalize_project(scores$project)
   if (is.null(info)) {
     scores$group_raw <- NA_character_
@@ -380,15 +518,16 @@ join_stratification <- function(scores, info) {
     scores$age <- NA_real_
     scores$stratification_match <- "not_available"
   } else {
-    exact <- match(paste(scores$sample, scores$vp_id, scores$project, sep = "|"),
-                   paste(info$sample, info$vp_id, info$project, sep = "|"))
+    exact <- match(paste(scores$sample, score_ids, scores$project, sep = "|"),
+                   paste(info$sample, info$id, info$project, sep = "|"))
+    exact[is.na(score_ids)] <- NA_integer_
     # A project-free master can only be joined on sample and ID if that ID
     # occurs exactly once across stratification projects.
-    missing <- which(is.na(exact) & is.na(scores$project))
-    id_key <- paste(info$sample, info$vp_id, sep = "|")
+    missing <- which(is.na(exact) & is.na(scores$project) & !is.na(score_ids))
+    id_key <- paste(info$sample, info$id, sep = "|")
     unique_id_key <- id_key[!duplicated(id_key) & !duplicated(id_key, fromLast = TRUE)]
-    fallback <- match(paste(scores$sample[missing], scores$vp_id[missing], sep = "|"), id_key)
-    fallback[!paste(scores$sample[missing], scores$vp_id[missing], sep = "|") %in% unique_id_key] <- NA_integer_
+    fallback <- match(paste(scores$sample[missing], score_ids[missing], sep = "|"), id_key)
+    fallback[!paste(scores$sample[missing], score_ids[missing], sep = "|") %in% unique_id_key] <- NA_integer_
     exact[missing] <- fallback
     scores$stratification_match <- ifelse(is.na(exact), "unmatched", "exact")
     scores$stratification_match[missing[!is.na(fallback)]] <- "unique_sample_id"
@@ -401,6 +540,8 @@ join_stratification <- function(scores, info) {
   scores$qc_project_3_4_5_unknown_to_HC <- !is.na(scores$project) &
     scores$project %in% c("3", "4", "5") & scores$group_status == "unknown"
   scores$group_status[scores$qc_project_3_4_5_unknown_to_HC] <- "HC"
+  scores$qc_project_3_hc_override <- !is.na(scores$project) & scores$project == "3"
+  scores$group_status[scores$qc_project_3_hc_override] <- "HC"
   scores$qc_project_6_hc_override <- !is.na(scores$project) & scores$project == "6"
   scores$group_status[scores$qc_project_6_hc_override] <- "HC"
   scores$gender_status <- gender_group(scores$gender_raw)
@@ -647,18 +788,42 @@ score_pair_plot <- function(data, variable_x, variable_y, overall_result) {
   p
 }
 
-score_files <- list.files(input_root, pattern = "_cognitive_scores\\.xlsx$",
-                          recursive = TRUE, full.names = TRUE, ignore.case = TRUE)
-score_files <- score_files[grepl("[/\\\\]derivatives[/\\\\]experiment_data[/\\\\]", score_files)]
-score_files <- score_files[!grepl("[/\\\\](old|old_data|discarded)[/\\\\]", score_files, ignore.case = TRUE)]
-if (!length(score_files)) stop("No pipeline score workbooks found below ", input_root)
+discover_score_files <- function(root) {
+  project_folders <- paste0(c(as.character(2:9), "all_projects"), "_backbone")
+  directories <- file.path(root, project_folders, "derivatives", "experiment_data")
+  directories <- directories[dir.exists(directories)]
+  files <- unique(unlist(lapply(directories, function(directory) {
+    list.files(directory, pattern = "_cognitive_scores(_exp-[12])?\\.xlsx$",
+               recursive = TRUE, full.names = TRUE, ignore.case = TRUE)
+  }), use.names = FALSE))
+  if (!length(files)) stop("No pipeline score workbooks found in project derivatives/experiment_data below ", root)
+  files <- files[!startsWith(basename(files), "~$") &
+    !grepl("(^|/)(old|old_data|discarded)(/|$)", normalize_path(files), ignore.case = TRUE)]
+  pattern <- "^(ALL|[2-9])_[0-9]{4}-[0-9]{2}-[0-9]{2}(_PILOT)?_(adults|adolescents|children_parents)_cognitive_scores(_exp-[12])?\\.xlsx$"
+  files <- files[grepl(pattern, basename(files), ignore.case = TRUE)]
+  dates <- input_date_from_path(files)
+  keep <- !is.na(dates)
+  if (nzchar(INPUT_DATE)) keep <- keep & dates == INPUT_DATE
+  files <- files[keep]
+  if (!length(files)) stop("No current dated cognitive score workbooks found below ", root)
+  # Keep the newest run per project/sample/experiment/pilot combination.
+  files <- files[order(extract_date_from_name(files), file.info(files)$mtime,
+                       decreasing = TRUE, na.last = TRUE)]
+  family <- paste(tolower(dirname(files)),
+                  tolower(sub("[0-9]{4}-[0-9]{2}-[0-9]{2}", "DATE", basename(files))))
+  sort(files[!duplicated(family)])
+}
+
+score_files <- discover_score_files(input_root)
 
 plot_inputs <- list()
 for (input_path in score_files) {
   message("QC: ", input_path)
   scores <- as.data.frame(readxl::read_excel(input_path, sheet = "cognitive_scores"))
   if (!nrow(scores)) { warning("Empty cognitive_scores sheet: ", input_path); next }
-  if (!"score_vp_id" %in% names(scores)) stop("Missing score_vp_id: ", input_path)
+  id_column <- first_existing_column(scores, c("id", "vp_id", "vp", "vpid", "participant_id", "participantid", "score_vp_id"))
+  if (is.na(id_column)) stop("Missing original participant ID: ", input_path)
+  names(scores)[match(id_column, names(scores))] <- "id"
   if (!"sample" %in% names(scores)) stop("Missing sample: ", input_path)
 
   rel <- substring(normalizePath(input_path, winslash = "/"),
@@ -670,44 +835,36 @@ for (input_path in score_files) {
   plot_path <- file.path(out_dir, paste0(stem, "_distributions.pdf"))
 
   info <- get_run_info(input_path)
-  input_file <- if (!is.null(info) && "input_file" %in% names(info)) info[["input_file"]] else NA_character_
-  if (is.na(input_file) || !file.exists(input_file)) {
-    warning("Original cognitive master unavailable; BACS trial RT QC skipped: ", input_path)
-    paths <- rep(NA_character_, nrow(scores))
-  } else {
-    exp_label <- if ("experiment_split" %in% names(info) &&
-                     !is.na(info[["experiment_split"]]) &&
-                     nzchar(info[["experiment_split"]])) {
-      tolower(info[["experiment_split"]])
-    } else NA_character_
-    master <- list(
-      path = input_file,
-      sample = tolower(as.character(scores$sample[1])),
-      pilot = "pilot" %in% names(info) && identical(tolower(info[["pilot"]]), "true"),
-      exp_label = exp_label
-    )
-    directories <- candidate_data_directories(master)
-    if (!"BACS" %in% names(scores)) {
-      warning("BACS filename column missing: ", input_path)
-      paths <- rep(NA_character_, nrow(scores))
-    } else {
-      paths <- vapply(as.character(scores$BACS), resolve_trial_path,
-                      character(1), directories = directories)
-    }
+  master <- master_for_scores(input_path, scores, info)
+  directories <- candidate_data_directories(master)
+  filenames <- rep(NA_character_, nrow(scores))
+  for (column in c("source_BACS_file", "BACS")) {
+    if (!column %in% names(scores)) next
+    candidate <- as.character(scores[[column]])
+    available <- !is.na(candidate) & nzchar(trimws(candidate))
+    use <- (is.na(filenames) | !nzchar(trimws(filenames))) & available
+    filenames[use] <- candidate[use]
   }
-  # This column exists only in the separate QC result, never in the score file.
+  paths <- vapply(filenames, resolve_trial_path, character(1), directories = directories)
+  if (any(!is.na(filenames)) && !length(directories)) {
+    warning("No matching raw cogtest_data folder found for: ", input_path)
+  }
+  # Full paths appear only in this separate QC output.
   scores$source_BACS_file <- paths
+  not_collected <- if ("Status_BACS" %in% names(scores)) {
+    !is.na(scores$Status_BACS) & scores$Status_BACS == "Nicht erhoben"
+  } else rep(FALSE, nrow(scores))
   cached <- new.env(parent = emptyenv())
-  rt_details <- lapply(paths, function(path) {
+  rt_details <- lapply(seq_along(paths), function(row) {
+    if (not_collected[row]) return(list(summary = empty_rt("Nicht erhoben"), trials = numeric()))
+    path <- paths[row]
     key <- if (is.na(path) || !nzchar(path)) "__MISSING__" else path
-    if (!exists(key, envir = cached, inherits = FALSE)) {
-      assign(key, read_bacs_rt(path), envir = cached)
-    }
+    if (!exists(key, envir = cached, inherits = FALSE)) assign(key, read_bacs_rt(path), envir = cached)
     get(key, envir = cached, inherits = FALSE)
   })
   raw_rt <- do.call(rbind, lapply(rt_details, `[[`, "summary"))
   qc <- cbind(
-    scores[, intersect(c("sample", "score_vp_id", "source_BACS_file",
+    scores[, intersect(c("sample", "id", "source_BACS_file",
                          "Status_BACS", "Status_WCST", "Status_LNS",
                          "score_BACS_correct", "score_BACS_mean_rt",
                          "score_WCST_pers_resp", "score_WCST_pers_err",
@@ -756,9 +913,10 @@ for (input_path in score_files) {
   all_rts <- unlist(lapply(rt_details[!duplicated(paths)], `[[`, "trials"), use.names = FALSE)
   slide_dir <- file.path(out_dir, paste0(stem, "_slides"))
   dir.create(slide_dir, recursive = TRUE, showWarnings = FALSE)
-  plot_key <- paste(scores$sample, scores$score_vp_id,
-                    if ("project" %in% names(scores)) scores$project else "", sep = "|")
-  missing_plot_id <- is.na(scores$score_vp_id)
+  project_column <- first_existing_column(scores, c("project", "p"))
+  plot_key <- paste(normalize_sample(scores$sample), normalize_id(scores$id),
+                    if (!is.na(project_column)) normalize_project(scores[[project_column]]) else "", sep = "|")
+  missing_plot_id <- is.na(normalize_id(scores$id))
   plot_key[missing_plot_id] <- paste0("missing_id_row_", which(missing_plot_id))
   if (anyDuplicated(plot_key)) {
     warning("Duplicate participant IDs excluded from plots (retained in QC table): ", input_path)
@@ -803,7 +961,9 @@ for (sample_name in c("adults", "adolescents")) {
                                      decreasing = TRUE, na.last = TRUE)])
   }
 }
-if (!length(selected)) stop("No adult or adolescent cognitive scores for combined QC")
+if (!length(selected)) {
+  message("Per-workbook QC complete; no adult/adolescent scores for combined presentation QC.")
+} else {
 
 all_score_vars <- unique(unlist(lapply(selected, function(path) {
   names(plot_inputs[[path]]$scores)[grepl("^score_(BACS|WCST|LNS)_", names(plot_inputs[[path]]$scores))]
@@ -826,7 +986,7 @@ compact_scores <- function(path) {
   project_values[is.na(project_values)] <- default_project
   out <- data.frame(
     sample = normalize_sample(df$sample),
-    score_vp_id = as.character(df$score_vp_id),
+    id = as.character(df$id),
     project = project_values,
     source_score_file = path,
     stringsAsFactors = FALSE
@@ -840,10 +1000,9 @@ compact_scores <- function(path) {
 
 combined <- do.call(rbind, lapply(selected, compact_scores))
 combined$sample <- normalize_sample(combined$sample)
-combined$score_vp_id <- normalize_id(combined$score_vp_id)
 combined$project <- normalize_project(combined$project)
-key <- paste(combined$sample, combined$score_vp_id, combined$project, sep = "|")
-missing_id <- is.na(combined$score_vp_id)
+key <- paste(combined$sample, normalize_id(combined$id), combined$project, sep = "|")
+missing_id <- is.na(normalize_id(combined$id))
 key[missing_id] <- paste0("missing_id_row_", which(missing_id))
 duplicated_rows <- duplicated(key)
 if (any(duplicated_rows)) {
@@ -978,9 +1137,9 @@ if (length(pairwise_results)) {
 as_sheet <- function(parts, message) {
   if (length(parts)) do.call(rbind, parts) else data.frame(note = message)
 }
-audit <- combined[c("sample", "score_vp_id", "project", "age", "gender_raw",
+audit <- combined[c("sample", "id", "project", "age", "gender_raw",
                     "gender_status", "group_raw", "group_status",
-                    "qc_project_3_4_5_unknown_to_HC", "qc_project_6_hc_override",
+                    "qc_project_3_4_5_unknown_to_HC", "qc_project_3_hc_override", "qc_project_6_hc_override",
                     "stratification_match",
                     "source_score_file")]
 audit$gender_status <- as.character(audit$gender_status)
@@ -1012,9 +1171,9 @@ writexl::write_xlsx(list(
               "project_3_4_5_group_rule", "project_6_group_rule",
               "gender_comparison", "diagnosis_comparison",
               "score_correlation"),
-    value = c(paste(selected, collapse = " | "), stratification_path,
+    value = c(paste(selected, collapse = " | "), paste(attr(stratification, "source_file"), collapse = " | "),
               "Unmatched or unrecognized group values remain unknown outside projects 3 to 6",
-              "Unknown status in projects 3, 4, and 5 is labelled HC; explicit with_diagnosis is retained; raw group is retained in the audit",
+              "All Project 3 participants are HC; unknown status in Projects 4 and 5 is HC; their explicit with_diagnosis is retained; raw group is retained in the audit",
               "All project 6 participants are labelled HC in this QC output; raw group is retained in the audit",
               "Only explicitly labelled men and women; Welch t-test is exploratory",
               "HC versus with_diagnosis excludes unknown; Welch t-test with Holm correction across available presentation scores",
@@ -1022,3 +1181,5 @@ writexl::write_xlsx(list(
   )
 ), file.path(combined_dir, "combined_presentation_QC.xlsx"))
 message("Combined PowerPoint-ready plots and statistics written to: ", combined_dir)
+
+} # Adult/adolescent combined presentation QC

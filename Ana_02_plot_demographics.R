@@ -1,7 +1,7 @@
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # FOR: Demographic plots from CLEANED backbone exports only
 # Description:
-# Reads the cleaned master CSV(s) created by the cleaning pipeline and produces
+# Reads the latest dated clean-master XLSX exports from prep03 and produces
 #  demographic plots (age density, education density, % women,
 # % single, height density, weight density).
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -16,26 +16,89 @@ ensure_packages <- function(pkgs) {
 }
 
 ensure_packages(c(
-  "dplyr", "forcats", "fs", "glue", "stringr", "ggplot2"
+  "dplyr", "forcats", "fs", "glue", "stringr", "ggplot2", "readxl"
 ))
 
 # ---- Paths -------------------------------------------------------------------
 
-script_dir <- function() {
-  if (!interactive()) {
-    args <- commandArgs(trailingOnly = FALSE)
-    file_arg <- "--file="
-    filepath <- sub(file_arg, "", args[grep(file_arg, args)])
-    if (length(filepath) == 1) return(normalizePath(dirname(filepath), winslash = "/"))
+# Resolve the data repository independently of the script's own subfolder.
+# BACKBONE_ROOT can override the established K: drive location.
+script_directory <- function() {
+  source_files <- vapply(sys.frames(), function(frame) {
+    p <- frame$ofile
+    if (is.null(p) || !length(p) || is.na(p[1])) "" else as.character(p[1])
+  }, character(1))
+  source_files <- source_files[nzchar(source_files)]
+  if (length(source_files)) {
+    return(dirname(normalizePath(tail(source_files, 1), winslash = "/", mustWork = FALSE)))
+  }
+  file_arg <- grep("^--file=", commandArgs(trailingOnly = FALSE), value = TRUE)
+  if (length(file_arg)) {
+    return(dirname(normalizePath(sub("^--file=", "", file_arg[1]), winslash = "/", mustWork = FALSE)))
   }
   if (requireNamespace("rstudioapi", quietly = TRUE) && rstudioapi::isAvailable()) {
-    p <- tryCatch(rstudioapi::getActiveDocumentContext()$path, error = function(e) "")
-    if (nzchar(p)) return(normalizePath(dirname(p), winslash = "/"))
+    p <- tryCatch(rstudioapi::getSourceEditorContext()$path, error = function(e) "")
+    if (length(p) == 1L && !is.na(p) && nzchar(p)) {
+      return(dirname(normalizePath(p, winslash = "/", mustWork = FALSE)))
+    }
   }
-  normalizePath(getwd(), winslash = "/")
+  normalizePath(getwd(), winslash = "/", mustWork = FALSE)
 }
 
-ROOT <- script_dir()
+resolve_backbone_root <- function(start = script_directory()) {
+  override <- Sys.getenv("BACKBONE_ROOT", unset = "")
+  if (nzchar(override)) {
+    if (!dir.exists(override)) stop("BACKBONE_ROOT does not exist: ", override)
+    return(normalizePath(override, winslash = "/", mustWork = TRUE))
+  }
+  for (location in unique(c(start, getwd()))) {
+    location <- normalizePath(location, winslash = "/", mustWork = FALSE)
+    repeat {
+      if (dir.exists(file.path(location, "01_project_data")) &&
+          any(dir.exists(file.path(location, c("02_cleaned", "03_analysis_input"))))) {
+        return(location)
+      }
+      parent <- dirname(location)
+      if (identical(parent, location)) break
+      location <- parent
+    }
+  }
+  default_root <- "K:/Wilken_Arbeitsordner/Clinical_Backbone_RU5389"
+  if (dir.exists(default_root)) return(default_root)
+  stop("Cannot locate Clinical_Backbone_RU5389. Set BACKBONE_ROOT to its root folder.")
+}
+
+input_date_from_path <- function(paths) {
+  vapply(paths, function(path) {
+    hit <- regexpr("[0-9]{4}-[0-9]{2}-[0-9]{2}", basename(path))
+    if (hit[1] < 0L) return(NA_character_)
+    stamp <- regmatches(basename(path), hit)
+    parsed <- suppressWarnings(as.Date(stamp, format = "%Y-%m-%d"))
+    if (is.na(parsed) || format(parsed, "%Y-%m-%d") != stamp) NA_character_ else stamp
+  }, character(1), USE.NAMES = FALSE)
+}
+
+latest_dated_file <- function(directory, pattern, input_date = "") {
+  files <- list.files(directory, pattern = pattern, full.names = TRUE,
+                      recursive = FALSE, ignore.case = TRUE)
+  files <- files[!startsWith(basename(files), "~$")]
+  dates <- input_date_from_path(files)
+  keep <- !is.na(dates)
+  if (nzchar(input_date)) keep <- keep & dates == input_date
+  files <- files[keep]
+  dates <- dates[keep]
+  if (!length(files)) {
+    stop("No matching dated input in ", directory, ": ", pattern,
+         if (nzchar(input_date)) paste0(" (date ", input_date, ")") else "")
+  }
+  newest <- max(dates)
+  hits <- files[dates == newest]
+  if (length(hits) != 1L) stop("Ambiguous input for ", newest, ": ", paste(hits, collapse = "; "))
+  hits[1]
+}
+
+ROOT <- resolve_backbone_root()
+INPUT_DATE <- Sys.getenv("BACKBONE_INPUT_DATE", unset = "")
 
 DIR_EXPORT        <- fs::path(ROOT, "02_cleaned")
 DIR_ANALYSIS_BASE <- fs::path(ROOT, "out", "internal_data_analysis", "demographics_and_health")
@@ -44,7 +107,7 @@ fs::dir_create(DIR_ANALYSIS_BASE)
 # Project colors (same as in cleaning script)
 vanilla_colors <- c(
   "p2"="#1B9E77","p3"="#D95F02","p4"="#7570B3", "p5"="#E7298A",
-  "p6 children"="#66A61E","p7"="#E6AB02", "p8 children"="#000000",
+  "p6"="#66A61E", "p6 children"="#66A61E","p7"="#E6AB02", "p8 children"="#000000",
   "p8 adults" ="#A6761D", "p9"="#7A7A7A"
 )
 
@@ -151,9 +214,10 @@ coerce_marital <- function(x) {
 prepare_demographics_for_plotting <- function(df, sample) {
   out <- df
   
-  if ("age_years" %in% names(out)) out$age_years <- suppressWarnings(as.numeric(out$age_years))
-  if ("height"   %in% names(out)) out$height    <- suppressWarnings(as.numeric(out$height))
-  if ("weight"   %in% names(out)) out$weight    <- suppressWarnings(as.numeric(out$weight))
+  if (!"age_years" %in% names(out) && "age" %in% names(out)) out$age_years <- out$age
+  for (column in intersect(c("age_years", "height", "weight"), names(out))) {
+    out[[column]] <- suppressWarnings(as.numeric(gsub(",", ".", as.character(out[[column]]), fixed = TRUE)))
+  }
   
   if ("gender" %in% names(out))    out$gender    <- coerce_gender(out$gender)
   if ("education" %in% names(out)) out$education <- coerce_education(out$education)
@@ -348,18 +412,22 @@ plot_simple_demographics_from_cleaned <- function(df_clean, sample, run_tag = fo
 }
 
 read_clean_master <- function(sample) {
-  f <- fs::path(DIR_EXPORT, sample, glue::glue("{sample}_clean_master.csv"))
-  if (!fs::file_exists(f)) stop("Clean master not found: ", f)
-  # matches write.csv2() (sep=';', dec=',')
-  read.csv2(f, stringsAsFactors = FALSE, check.names = FALSE)
+  folder <- file.path(DIR_EXPORT, sample)
+  if (!dir.exists(folder)) stop("Cleaned sample folder not found: ", folder)
+  pattern <- paste0("^[0-9]{4}-[0-9]{2}-[0-9]{2}_", sample, "_clean_master\\.xlsx$")
+  path <- latest_dated_file(folder, pattern, input_date = INPUT_DATE)
+  message("Reading clean master: ", path)
+  data <- as.data.frame(readxl::read_excel(path, .name_repair = "minimal"))
+  attr(data, "input_file") <- path
+  attr(data, "input_date") <- input_date_from_path(path)
+  data
 }
 
 # ---- Main --------------------------------------------------------------------
 
-SAMPLES_TO_PLOT <- c("adults")   # e.g. c("adolescents","adults","children_p6",...)
-RUN_TAG <- format(Sys.Date(), "%Y-%m-%d")  # folder tag; change if you want
+SAMPLES_TO_PLOT <- c("adults")   # e.g. c("adults", "adolescents", "children_parents")
 
-for (s in SAMPLES_TO_PLOT) {
-  df <- read_clean_master(s)
-  plot_simple_demographics_from_cleaned(df, s, run_tag = RUN_TAG)
+for (sample in SAMPLES_TO_PLOT) {
+  data <- read_clean_master(sample)
+  plot_simple_demographics_from_cleaned(data, sample, run_tag = attr(data, "input_date"))
 }

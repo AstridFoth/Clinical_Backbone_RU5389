@@ -15,6 +15,11 @@
 # - Filtered rerun affects omega only (not the original loadings sheets)
 # - Separate datasets keep separate filtering logic
 # - Combined dataset uses combined filtering logic
+# - Includes fixed, frequency-only CAPE positive factors from Schlier et al.
+#   (2015), Table 2. Rerun updated Step 03 first to regenerate the keys.
+# - The two-item CAPE factors use inter-item r + Spearman-Brown. Omega and
+#   one-factor loadings are not estimated for these underidentified factors.
+# - Literature-defined CAPE factors keep all their items in the filtered round.
 # ------------------------------------------------------------------------------
 
 rm(list = ls(all.names = TRUE)); invisible(gc())
@@ -134,6 +139,12 @@ get_id_vec <- function(z) {
   else rep(NA_character_, nrow(z))
 }
 
+is_cape_positive_schlier2015_subscale <- function(scale, subscale) {
+  !is.na(scale) & toupper(trimws(as.character(scale))) == "CAPE" &
+    !is.na(subscale) & startsWith(tolower(trimws(as.character(subscale))),
+                                 "positive_schlier2015_")
+}
+
 flatten_keys <- function(keys_json) {
   keys_raw <- jsonlite::read_json(keys_json, simplifyVector = FALSE)
   
@@ -147,6 +158,14 @@ flatten_keys <- function(keys_json) {
     subscale = purrr::map_chr(keys_raw$items_by_subscale, ~ .x$subscale %||% NA_character_),
     items    = purrr::map(keys_raw$items_by_subscale, ~ as.character(.x$items %||% character(0)))
   )
+
+  if (any(toupper(trimws(items_by_scale$scale)) == "CAPE", na.rm = TRUE) &&
+      (is.null(keys_raw$cape_positive_schlier2015) ||
+       sum(is_cape_positive_schlier2015_subscale(
+         items_by_subscale$scale, items_by_subscale$subscale
+       )) != 5L)) {
+    stop("CAPE Schlier2015 keys are missing or incomplete. Rerun the updated Step 03 before Step 04.")
+  }
   
   .as_chr0 <- function(x) {
     if (is.null(x)) return(character(0))
@@ -318,6 +337,8 @@ make_dataset_defs <- function(sample_bundles) {
 # ===== Matching / filtering helpers =====
 drop_flagged_items <- function(items, flagged_tbl = NULL,
                                level = NULL, scale = NULL, subscale = NULL) {
+  if (identical(level, "subscale") &&
+      isTRUE(is_cape_positive_schlier2015_subscale(scale, subscale))) return(items)
   if (is.null(flagged_tbl) || !nrow(flagged_tbl)) return(items)
   
   flagged_here <- flagged_tbl %>%
@@ -345,7 +366,8 @@ match_items <- function(col_map, items) {
 }
 
 # ===== Omega =====
-compute_omega_safe <- function(items_df, timeout_sec = CFG$omega_timeout_sec) {
+compute_omega_safe <- function(items_df, timeout_sec = CFG$omega_timeout_sec,
+                               min_items = 2L) {
   items_df[] <- lapply(items_df, function(z) suppressWarnings(as.numeric(z)))
   
   keep <- vapply(items_df, function(z) {
@@ -354,7 +376,7 @@ compute_omega_safe <- function(items_df, timeout_sec = CFG$omega_timeout_sec) {
   }, logical(1))
   items_df <- items_df[, keep, drop = FALSE]
   
-  if (ncol(items_df) < 2L || nrow(items_df) < 10L) return(NA_real_)
+  if (ncol(items_df) < min_items || nrow(items_df) < 10L) return(NA_real_)
   
   setTimeLimit(elapsed = timeout_sec, transient = TRUE)
   on.exit(setTimeLimit(cpu = Inf, elapsed = Inf, transient = FALSE), add = TRUE)
@@ -383,6 +405,8 @@ compute_omega_safe <- function(items_df, timeout_sec = CFG$omega_timeout_sec) {
 
 omega_for <- function(d, col_map, items, logger,
                       scale_label = NULL, sub_label = NULL) {
+  fixed_cape_factor <- isTRUE(is_cape_positive_schlier2015_subscale(scale_label, sub_label))
+  if (fixed_cape_factor && length(items) == 2L) return(NA_real_)
   items_norm <- normalize_id(items)
   keep_norm  <- intersect(items_norm, col_map$item_norm)
   if (length(keep_norm) < 2L) return(NA_real_)
@@ -395,11 +419,53 @@ omega_for <- function(d, col_map, items, logger,
   X <- X[has_any_item, , drop = FALSE]
   
   if (nrow(X) < 10L) return(NA_real_)
-  compute_omega_safe(X)
+  compute_omega_safe(X, min_items = if (fixed_cape_factor) 3L else 2L)
+}
+
+# A two-indicator unrestricted one-factor model is underidentified. Report a
+# transparent two-item reliability summary instead of fitting that model.
+# This is an additional diagnostic; the paper does not prescribe this index.
+cape_two_item_reliability <- function(d, col_map, items) {
+  empty <- list(r = NA_real_, spearman_brown = NA_real_, n_used = 0L)
+  cols <- col_map$orig[match(normalize_id(items), col_map$item_norm)]
+  if (length(cols) != 2L || anyNA(cols)) return(empty)
+  X <- d[, cols, drop = FALSE]
+  X[] <- lapply(X, function(x) suppressWarnings(as.numeric(x)))
+  X <- X[is.finite(X[[1]]) & is.finite(X[[2]]), , drop = FALSE]
+  empty$n_used <- nrow(X)
+  if (nrow(X) < 10L || stats::sd(X[[1]]) <= 0 || stats::sd(X[[2]]) <= 0) return(empty)
+  r <- stats::cor(X[[1]], X[[2]])
+  list(
+    r = r,
+    spearman_brown = if (is.finite(r) && 1 + r > sqrt(.Machine$double.eps)) {
+      2 * r / (1 + r)
+    } else NA_real_,
+    n_used = nrow(X)
+  )
+}
+
+cape_two_item_summary <- function(d, col_map, items) {
+  all <- cape_two_item_reliability(d, col_map, items)
+  hc <- patient <- list(r = NA_real_, spearman_brown = NA_real_, n_used = NA_integer_)
+  if (isTRUE(CFG$compute_group_omega) && "group" %in% names(d)) {
+    hc <- cape_two_item_reliability(dplyr::filter(d, .data$group %in% "HC"), col_map, items)
+    patient <- cape_two_item_reliability(dplyr::filter(d, .data$group %in% "patient"), col_map, items)
+  }
+  tibble::tibble(
+    interitem_r_all = all$r,
+    spearman_brown_all = all$spearman_brown,
+    n_used_two_items_all = all$n_used,
+    interitem_r_HC = hc$r,
+    spearman_brown_HC = hc$spearman_brown,
+    interitem_r_patient = patient$r,
+    spearman_brown_patient = patient$spearman_brown,
+    reliability_note = "Two-item factor: inter-item r and Spearman-Brown; omega not estimated"
+  )
 }
 
 # ===== Loadings =====
-compute_loadings_safe <- function(items_df, timeout_sec = CFG$omega_timeout_sec) {
+compute_loadings_safe <- function(items_df, timeout_sec = CFG$omega_timeout_sec,
+                                 min_items = 2L) {
   items_df[] <- lapply(items_df, function(z) suppressWarnings(as.numeric(z)))
   
   keep <- vapply(items_df, function(z) {
@@ -408,7 +474,7 @@ compute_loadings_safe <- function(items_df, timeout_sec = CFG$omega_timeout_sec)
   }, logical(1))
   items_df <- items_df[, keep, drop = FALSE]
   
-  if (ncol(items_df) < 2L || nrow(items_df) < 20L) return(NULL)
+  if (ncol(items_df) < min_items || nrow(items_df) < 20L) return(NULL)
   
   setTimeLimit(elapsed = timeout_sec, transient = TRUE)
   on.exit(setTimeLimit(cpu = Inf, elapsed = Inf, transient = FALSE), add = TRUE)
@@ -447,8 +513,18 @@ loadings_for <- function(d, col_map, items,
   
   has_any_item <- rowSums(!is.na(as.matrix(X))) > 0
   X <- X[has_any_item, , drop = FALSE]
-  
-  L <- compute_loadings_safe(X)
+
+  fixed_cape_factor <- isTRUE(is_cape_positive_schlier2015_subscale(scale, subscale))
+  if (fixed_cape_factor && length(items) == 2L) {
+    return(tibble::tibble(
+      level = level, scale = scale, subscale = subscale,
+      total_source = total_source, item = orig_cols,
+      loading = NA_real_, communality = NA_real_, uniqueness = NA_real_,
+      n_used = sum(is.finite(X[[1]]) & is.finite(X[[2]])),
+      method = "not estimated: two-item factor (underidentified)"
+    ))
+  }
+  L <- compute_loadings_safe(X, min_items = if (fixed_cape_factor) 3L else 2L)
   if (is.null(L) || !nrow(L)) return(tibble::tibble())
   
   dplyr::mutate(
@@ -546,6 +622,17 @@ omega_block <- function(dset, items, level, scale, subscale = NA_character_,
     })
     
     out <- dplyr::bind_rows(out, proj_rows)
+  }
+
+  if (isTRUE(is_cape_positive_schlier2015_subscale(scale, subscale)) &&
+      length(items) == 2L) {
+    extra <- purrr::map_dfr(out$project, function(pv) {
+      d_block <- if (identical(pv, "OVERALL")) df else {
+        df[!is.na(df[[proj_col]]) & as.character(df[[proj_col]]) == pv, , drop = FALSE]
+      }
+      cape_two_item_summary(d_block, col_map, items)
+    })
+    out <- dplyr::bind_cols(out, extra)
   }
   
   out
@@ -719,6 +806,7 @@ if (isTRUE(CFG$export_loading_filtered)) {
     non_suq_flagged <- x %>%
       dplyr::filter(
         .data$scale_norm != "SUQ",
+        !is_cape_positive_schlier2015_subscale(.data$scale, .data$subscale),
         !is.na(.data$loading),
         .data$abs_loading < threshold
       )

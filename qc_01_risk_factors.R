@@ -21,63 +21,138 @@ pacman::p_load(
 # 2. DEFINE FILE PATHS
 # ==============================================================================
 
-base_path <- "K:/Wilken_Arbeitsordner/Clinical_Backbone_RU5389"
+# Resolve the data repository independently of the script's own subfolder.
+# BACKBONE_ROOT can override the established K: drive location.
+script_directory <- function() {
+  source_files <- vapply(sys.frames(), function(frame) {
+    p <- frame$ofile
+    if (is.null(p) || !length(p) || is.na(p[1])) "" else as.character(p[1])
+  }, character(1))
+  source_files <- source_files[nzchar(source_files)]
+  if (length(source_files)) {
+    return(dirname(normalizePath(tail(source_files, 1), winslash = "/", mustWork = FALSE)))
+  }
+  file_arg <- grep("^--file=", commandArgs(trailingOnly = FALSE), value = TRUE)
+  if (length(file_arg)) {
+    return(dirname(normalizePath(sub("^--file=", "", file_arg[1]), winslash = "/", mustWork = FALSE)))
+  }
+  if (requireNamespace("rstudioapi", quietly = TRUE) && rstudioapi::isAvailable()) {
+    p <- tryCatch(rstudioapi::getSourceEditorContext()$path, error = function(e) "")
+    if (length(p) == 1L && !is.na(p) && nzchar(p)) {
+      return(dirname(normalizePath(p, winslash = "/", mustWork = FALSE)))
+    }
+  }
+  normalizePath(getwd(), winslash = "/", mustWork = FALSE)
+}
 
-input_items <- file.path(
-  base_path,
-  "03_analysis_input/adults_adolescents_complete_items.xlsx"
+resolve_backbone_root <- function(start = script_directory()) {
+  override <- Sys.getenv("BACKBONE_ROOT", unset = "")
+  if (nzchar(override)) {
+    if (!dir.exists(override)) stop("BACKBONE_ROOT does not exist: ", override)
+    return(normalizePath(override, winslash = "/", mustWork = TRUE))
+  }
+  for (location in unique(c(start, getwd()))) {
+    location <- normalizePath(location, winslash = "/", mustWork = FALSE)
+    repeat {
+      if (dir.exists(file.path(location, "01_project_data")) &&
+          any(dir.exists(file.path(location, c("02_cleaned", "03_analysis_input"))))) {
+        return(location)
+      }
+      parent <- dirname(location)
+      if (identical(parent, location)) break
+      location <- parent
+    }
+  }
+  default_root <- "K:/Wilken_Arbeitsordner/Clinical_Backbone_RU5389"
+  if (dir.exists(default_root)) return(default_root)
+  stop("Cannot locate Clinical_Backbone_RU5389. Set BACKBONE_ROOT to its root folder.")
+}
+
+input_date_from_path <- function(paths) {
+  vapply(paths, function(path) {
+    hit <- regexpr("[0-9]{4}-[0-9]{2}-[0-9]{2}", basename(path))
+    if (hit[1] < 0L) return(NA_character_)
+    stamp <- regmatches(basename(path), hit)
+    parsed <- suppressWarnings(as.Date(stamp, format = "%Y-%m-%d"))
+    if (is.na(parsed) || format(parsed, "%Y-%m-%d") != stamp) NA_character_ else stamp
+  }, character(1), USE.NAMES = FALSE)
+}
+
+latest_dated_file <- function(directory, pattern, input_date = "") {
+  files <- list.files(directory, pattern = pattern, full.names = TRUE,
+                      recursive = FALSE, ignore.case = TRUE)
+  files <- files[!startsWith(basename(files), "~$")]
+  dates <- input_date_from_path(files)
+  keep <- !is.na(dates)
+  if (nzchar(input_date)) keep <- keep & dates == input_date
+  files <- files[keep]
+  dates <- dates[keep]
+  if (!length(files)) {
+    stop("No matching dated input in ", directory, ": ", pattern,
+         if (nzchar(input_date)) paste0(" (date ", input_date, ")") else "")
+  }
+  newest <- max(dates)
+  hits <- files[dates == newest]
+  if (length(hits) != 1L) stop("Ambiguous input for ", newest, ": ", paste(hits, collapse = "; "))
+  hits[1]
+}
+
+base_path <- resolve_backbone_root()
+analysis_dir <- file.path(base_path, "03_analysis_input")
+INPUT_DATE <- Sys.getenv("BACKBONE_INPUT_DATE", unset = "")
+
+# FHS and CTQ use the full COMPLETE exports, before loading-based filtering.
+# Match both workbooks to the same export date; never mix pipeline runs.
+input_items <- latest_dated_file(
+  analysis_dir,
+  "^[0-9]{4}-[0-9]{2}-[0-9]{2}_adults_adolescents_complete_items\\.xlsx$",
+  input_date = INPUT_DATE
 )
-
-input_sub <- file.path(
-  base_path,
-  "03_analysis_input/adults_adolescents_complete_subscales.xlsx"
+RUN_TAG <- input_date_from_path(input_items)
+input_sub <- latest_dated_file(
+  analysis_dir,
+  "^[0-9]{4}-[0-9]{2}-[0-9]{2}_adults_adolescents_complete_subscales\\.xlsx$",
+  input_date = RUN_TAG
 )
-
 output_dir <- file.path(
-  base_path,
-  "plots_sanity_check/risk_factors"
+  base_path, "out", "internal_data_analysis", "risk_factors",
+  paste0(RUN_TAG, "_adults_adolescents")
 )
-
-if (!dir.exists(output_dir)) {
-  dir.create(output_dir, recursive = TRUE)
-}
-
-if (!file.exists(input_items)) {
-  stop("Item-level input file does not exist: ", input_items)
-}
-
-if (!file.exists(input_sub)) {
-  stop("Subscale-level input file does not exist: ", input_sub)
-}
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
 
 # ==============================================================================
 # 3. LOAD AND JOIN DATA
 # ==============================================================================
 
-message("Loading Excel files...")
+read_combined_export <- function(path) {
+  sheets <- readxl::excel_sheets(path)
+  combined <- sheets[tolower(sheets) == "combined"]
+  if (length(combined) == 1L) {
+    data <- readxl::read_excel(path, sheet = combined, .name_repair = "minimal")
+  } else {
+    # If a workbook has only sample sheets, combine them once.
+    sample_sheets <- sheets[tolower(sheets) %in% c("adults", "adolescents")]
+    if (!length(sample_sheets)) stop("No combined or sample sheets in: ", path)
+    data <- dplyr::bind_rows(lapply(sample_sheets, function(sheet) {
+      part <- readxl::read_excel(path, sheet = sheet, .name_repair = "minimal")
+      if (!"sample" %in% names(part)) part$sample <- tolower(sheet)
+      part
+    }))
+  }
+  if (!"sample" %in% names(data)) stop("Missing sample column in: ", path)
+  if (anyDuplicated(names(data))) stop("Duplicate column names in: ", path)
+  message("Read ", nrow(data), " rows from: ", path)
+  data
+}
 
-df_items <- read_excel(input_items)
-df_sub   <- read_excel(input_sub)
-
-message(
-  "Item-level file: ",
-  nrow(df_items),
-  " rows and ",
-  ncol(df_items),
-  " columns."
-)
-
-message(
-  "Subscale-level file: ",
-  nrow(df_sub),
-  " rows and ",
-  ncol(df_sub),
-  " columns."
-)
+message("Loading COMPLETE workbooks from ", RUN_TAG, "...")
+df_items <- read_combined_export(input_items)
+df_sub <- read_combined_export(input_sub)
 
 # Identify the participant ID column explicitly
 id_candidates <- c(
   "vp_id",
+  "vp",
   "vpid",
   "participant_id",
   "participant",
@@ -102,6 +177,9 @@ join_keys <- id_col
 if ("sample" %in% names(df_items) &&
     "sample" %in% names(df_sub)) {
   join_keys <- c("sample", id_col)
+}
+if ("project" %in% names(df_items) && "project" %in% names(df_sub)) {
+  join_keys <- c(join_keys, "project")
 }
 
 message(
@@ -143,6 +221,7 @@ duplicate_report <- full_join(
 if (nrow(duplicate_report) > 0) {
   message("Repeated participant IDs found:")
   print(duplicate_report, n = Inf)
+  readr::write_csv(duplicate_report, file.path(output_dir, "duplicate_join_keys.csv"))
 }
 
 has_duplicates <- nrow(duplicate_report) > 0
@@ -672,19 +751,16 @@ if (length(p4_cols) == 0) {
 # PLOT 5A: CTQ SUBSCALE MEANS
 # ------------------------------------------------------------------------------
 
-ctq_sub_cols <- names(df)[
-  str_detect(
-    names(df),
-    "(?i)^ctq_|^score_ctq_"
-  )
+# Select scored subscales from the subscale workbook, never CTQ item columns.
+ctq_sub_cols <- names(df_sub)[
+  str_detect(names(df_sub), "(?i)^score_ctq__") &
+    !str_detect(names(df_sub), "(?i)^score_ctq__total(?:_(sum|mean))?$")
 ]
-
-ctq_sub_cols <- ctq_sub_cols[
-  !str_detect(
-    ctq_sub_cols,
-    "(?i)total|^score_ctq$"
-  )
-]
+# If both metrics exist, show the sum once.
+ctq_sub_cols <- ctq_sub_cols[!vapply(ctq_sub_cols, function(column) {
+  grepl("_mean$", column, ignore.case = TRUE) &&
+    sub("_mean$", "_sum", column, ignore.case = TRUE) %in% ctq_sub_cols
+}, logical(1))]
 
 if (length(ctq_sub_cols) == 0) {
   
@@ -711,7 +787,7 @@ if (length(ctq_sub_cols) == 0) {
     mutate(
       Subscale = str_replace_all(
         Subscale,
-        "(?i)ctq_|_score",
+        "(?i)^score_ctq__|_(sum|mean)$",
         ""
       ) %>%
         str_replace_all("_", " ") %>%
@@ -789,7 +865,7 @@ if (length(ctq_sub_cols) == 0) {
 ctq_total_col <- names(df)[
   str_detect(
     names(df),
-    "(?i)^score_ctq$|^score_ctq__total$|^ctq_total$"
+    "(?i)^score_ctq$|^score_ctq__total(?:_sum)?$|^ctq_total$"
   )
 ]
 
