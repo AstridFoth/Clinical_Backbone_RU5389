@@ -391,7 +391,6 @@ source(file.path(function_path, "aggregate_scales.R"))
 source(file.path(function_path, "extract_scales.R"))
 source(file.path(function_path, "prepare_project_slices.R"))
 source(file.path(function_path, "write_project_slices.R"))
-source(file.path(function_path, "analyze_rushing.R"))
 
 
 ## Move old Data ---------------------------------------------------------------
@@ -2149,64 +2148,8 @@ res_parents_p6 <- resolve_duplicates(dat_parents_p6, vp_col, submit_col,
 dat_parents_p6 <- res_parents_p6$cleaned
 trash_parents_p6 <- res_parents_p6$trash_bin
 
-# Flag invariant responding across all raw IDAS items ---------------------------
-# Do NOT remove these otherwise valid questionnaire rows here. The flag is
-# exported with the questionnaire data and is acted upon in prep03.
-add_invariant_idas_flag <- function(df, sample, item_info = item_info_adults) {
-  # IDAS item names in the questionnaire data are identical to the names in the
-  # Item column of Item Information Adults, e.g. IDAS[001], IDAS[002], ...
-  idas_items <- item_info$Item[
-    grepl("^IDAS\\[[0-9]+\\]$", trimws(as.character(item_info$Item)))
-  ]
-  idas_items <- unique(trimws(as.character(idas_items)))
-  
-  if (!length(idas_items)) {
-    stop("No IDAS item names found in item_info_adults$Item.")
-  }
-  
-  # Exact matching only: no renaming or normalization.
-  idas_cols <- idas_items[idas_items %in% names(df)]
-  missing_idas_cols <- setdiff(idas_items, names(df))
-  
-  if (!length(idas_cols)) {
-    stop(
-      "None of the IDAS items listed in item_info_adults$Item were found in sample '",
-      sample, "'."
-    )
-  }
-  
-  if (length(missing_idas_cols)) {
-    stop(
-      "Some IDAS items listed in item_info_adults$Item are missing from sample '",
-      sample, "': ", paste(missing_idas_cols, collapse = ", ")
-    )
-  }
-  
-  idas_values <- as.data.frame(
-    lapply(df[, idas_cols, drop = FALSE], as.character),
-    stringsAsFactors = FALSE
-  )
-  
-  invariant <- apply(idas_values, 1, function(x) {
-    # Straightlining requires observed answers on every IDAS item.
-    # Missing/blank responses are handled by missingness checks, not this flag.
-    all(!is.na(x) & nzchar(trimws(x))) && length(unique(x)) == 1L
-  })
-  
-  df$idas_invariant_response_flag <- as.logical(invariant)
-  
-  message(
-    "IDAS invariant-response flag for ", sample, ": checked ",
-    length(idas_cols), " raw IDAS items; flagged ",
-    sum(df$idas_invariant_response_flag), " of ", nrow(df),
-    " row(s). No rows removed in this script."
-  )
-  
-  df
-}
-
-dat_adults <- add_invariant_idas_flag(dat_adults, "adults")
-dat_adolescents <- add_invariant_idas_flag(dat_adolescents, "adolescents")
+# Questionnaire quality flags and exclusions (rushing and straightlining) are
+# calculated together in Step 03, using the raw questionnaire exports below.
 
 # Special Case Project 8: Check C, P and A entries -----------------------------
 check_vpid_forms(dat_children_parents, logger = logger)
@@ -2265,24 +2208,14 @@ preps <- lapply(names(samples), function(s) {
 
 names(preps) <- names(samples)
 
-# 2) pooled rushing for adults + adolescents (single PNG, shared cutoff)
-pooled <- analyze_rushing(preps[c("adults","adolescents")])
-preps["adults"]      <- pooled["adults"]
-preps["adolescents"] <- pooled["adolescents"]
-
-# 3) rushing for the other samples individually (optional; now minutes-based)
-for (s in setdiff(names(preps), c("adults","adolescents"))) {
-  preps[[s]] <- analyze_rushing(preps[[s]])
-}
-
-# 4) now write everything
+# Write raw questionnaire exports. Step 03 computes all quality flags.
 lapply(names(preps), function(s) write_project_slices(preps[[s]]))
 
 # -------------------------------------------------------------------------
 # Additional Project 3 questionnaire exports: exp_1 vs exp_2
 # -------------------------------------------------------------------------
 
-# Prefer the fully processed exported object if available (includes rushing etc.)
+# Prefer the prepared questionnaire export if available.
 p3_questionnaire_export <- if (exists("data_adults_p_3_questionnaire", envir = .GlobalEnv)) {
   get("data_adults_p_3_questionnaire", envir = .GlobalEnv)
 } else {

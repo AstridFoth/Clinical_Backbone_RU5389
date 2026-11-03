@@ -2,14 +2,17 @@
 # Monitoring 1 — Extract Sample Information (Patched: Option B for submitdates)
 # Authors: Saskia Wilken (saskia.wilken@uni-hamburg.de, saskia.a.wilken@gmail.com)
 # Created: 2025-10-29
-# Patch date: 2025-11-25
+# Patch date: 2026-11-03
 #
 # What this does
 # - Reads the 3-sheet ID completeness report create by mon_01:
 #   1) complete datasets
 #   2) datasets missing questionnaire data (=> cognitive present)
 #   3) datasets missing cognitive test data (=> questionnaires present)
-# - Produces a progress plot (PNG) and a summary XLSX.
+# - Writes overview and per-project completeness workbooks.
+# - Project 6 has infants, children/parents, and adults. Adults require cognitive
+#   tests only: their cogtest IDs are complete without questionnaire data; their
+#   dates come from the cogtest submitdates sheet.
 #
 # Patch summary (Option B):
 # - When attaching submit dates to IDs, pick the LAST non-NA value among duplicates
@@ -258,8 +261,11 @@ for (k in all_keys) {
   cog_ids <- cog_map[[k]] %||% character()
   q_ids   <- q_all[[k]] %||% character()
   
-  complete   <- intersect(cog_ids, q_ids)
-  missing_q  <- setdiff(cog_ids, q_ids)
+  # Completeness follows the data types required by each subproject.
+  # p6 adults collect cognitive tests only; questionnaires are not expected.
+  cognitive_only <- project == 6L && sample == "adults"
+  complete   <- if (cognitive_only) cog_ids else intersect(cog_ids, q_ids)
+  missing_q  <- if (cognitive_only) character() else setdiff(cog_ids, q_ids)
   missing_c  <- setdiff(q_ids, cog_ids)
   
   if (length(complete))

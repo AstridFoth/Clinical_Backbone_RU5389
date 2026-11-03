@@ -2,13 +2,15 @@
 # Monitoring 3 — Timeline of Data Collection (with projections + ideal state)
 # Authors: Saskia Wilken (+ modifications)
 # Created: 2025-11-10
+# Updated: 2026-11-03
 #
 # What this does
 # - Reads the newest *_id_completeness_report.xlsx (by leading YYYY-MM-DD tag) and the Target_Sample_Size_Projects.xlsx
 # - Uses the "submitdate" alongside id + sample to build per-project timelines
 # - Produces two kinds of timeline plots (absolute & percent as stacked subplots):
 #     1) Vanilla layout (one line per project p2..p9)
-#     2) Split layout (p8 children & adults separated; others aggregated)
+#     2) Split layout (p6 children/adults and p8 children/adults separated;
+#        p6 infants remain hidden in this layout as before)
 # - For each layout it saves:
 #     A) Empirical timeline only
 #     B) Empirical timeline + per-project linear regression with 95% CI (Newey–West) and horizon to 31.12.2027
@@ -22,7 +24,11 @@
 # Notes
 # - Each project/group has its own color (legend).
 # - X axis spans from fixed origin 01.08.2024 to 31.12.2027 for prediction/ideal plots.
-# - Percent uses the appropriate target (vanilla = project target; split = p8 per-sample target, others project target).
+# - p6 adults collect cognitive tests only and are complete per Mon_01.
+# - Percent uses the appropriate target. p6 adults require their own "p6 adults"
+#   row in the split target sheet; no fallback to the existing p6 target is used.
+#   Until that target is supplied, their absolute timeline is shown, while
+#   percentages and target-dependent estimates remain NA (also for aggregated p6).
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 # Clean up R environment -------------------------------------------------------
@@ -189,12 +195,19 @@ read_sheet_timeline <- function(path, sheet){
 
 sheet_complete <- read_sheet_timeline(report_path, "complete")
 if (!nrow(sheet_complete)) stop("No rows in 'complete' sheet with submitdate found.")
+# Run Mon_01 first: p6 adults enter complete with their cognitive-test dates;
+# questionnaires are not required for this subproject.
 
 timeline_raw <- sheet_complete %>%
   dplyr::mutate(sample = ifelse(is.na(sample) | sample == "", "ALL", sample)) %>%
   dplyr::group_by(project, sample, pid) %>%
   dplyr::summarise(submitdate = min(submitdate, na.rm = TRUE), .groups="drop") %>%
   dplyr::filter(!is.na(submitdate))
+
+# A missing adult target also leaves the combined p6 target unknown.
+p6_adults_target_missing <- any(timeline_raw$project == 6 & timeline_raw$sample == "adults") &&
+  !any(targets_split$project == 6 & targets_split$sample == "adults" &
+         is.finite(targets_split$target) & targets_split$target > 0)
 
 # ---- Colors ----
 vanilla_colors <- c(
@@ -208,7 +221,8 @@ color_map_split <- c(
   color_map,
   "p8 children"="#000000",
   "p8 adults"  ="#A6761D",
-  "p6 children"= unname(vanilla_colors["p6"])
+  "p6 children"= unname(vanilla_colors["p6"]),
+  "p6 adults"  = "#17BECF"
 )
 names(color_map_split) <- stringr::str_squish(names(color_map_split))
 
@@ -234,6 +248,7 @@ add_percent_vanilla <- function(df_cum){
     dplyr::mutate(
       project_id = paste0("p", project),
       target = suppressWarnings(as.numeric(total_targets[project_id])),
+      target = dplyr::if_else(project == 6 & p6_adults_target_missing, NA_real_, target),
       pct = ifelse(is.na(target) | target <= 0, NA_real_, pmin(100, 100*cum_n/target))
     )
 }
@@ -244,7 +259,8 @@ add_percent_split <- function(df_cum){
     dplyr::left_join(targets_split, by = c("project","sample")) %>%
     dplyr::mutate(
       proj_target   = suppressWarnings(as.numeric(total_targets[project_id])),
-      sample_target = dplyr::coalesce(target, proj_target)
+      sample_target = dplyr::if_else(project == 6 & sample == "adults",
+                                     target, dplyr::coalesce(target, proj_target))
     ) %>%
     dplyr::select(-target) %>%
     dplyr::mutate(
@@ -267,6 +283,7 @@ split_cum <- timeline_raw %>%
       project == 8 & stringr::str_detect(sample, "adult") ~ "adults",
       project == 8 & stringr::str_detect(sample, "child") ~ "children",
       project == 6 & stringr::str_detect(sample, "child") ~ "children",
+      project == 6 & sample == "adults"                  ~ "adults",
       project == 6                                        ~ NA_character_,
       TRUE                                                ~ "ALL"
     )
@@ -278,6 +295,7 @@ split_cum <- timeline_raw %>%
     project == 8 & sample == "children" ~ "p8 children",
     project == 8 & sample == "adults"   ~ "p8 adults",
     project == 6 & sample == "children" ~ "p6 children",
+    project == 6 & sample == "adults"   ~ "p6 adults",
     TRUE                                ~ paste0("p", project)
   ),
   label = stringr::str_squish(label))
@@ -435,9 +453,11 @@ plot_timeline <- function(df, layout = c("vanilla","split"),
       df %>% dplyr::group_by(col_lab) %>% dplyr::slice_max(date, n = 1, with_ties = FALSE) %>%
         dplyr::ungroup() %>% dplyr::summarise(mx = max(cum_n, na.rm = TRUE)) %>% dplyr::pull(mx)
     }
-    legend_order <- c("p2","p3","p4","p5","p6 children","p7","p8 adults","p8 children","p9")
+    legend_order <- c("p2","p3","p4","p5","p6 children","p6 adults","p7","p8 adults","p8 children","p9")
     legend_order <- legend_order[legend_order %in% unique(df$col_lab)]
   }
+  # Unknown targets must not clip observed counts in the absolute panel.
+  y_abs_limit <- max(c(y_abs_limit, df$cum_n), na.rm = TRUE)
   if (!is.finite(y_abs_limit) || is.na(y_abs_limit)) y_abs_limit <- NA_real_
   
   # X range and breaks (IMPORTANT: prediction + ideal plots go to 31.12.2027)
@@ -453,8 +473,9 @@ plot_timeline <- function(df, layout = c("vanilla","split"),
   # Prediction series (truncate at first target/100% hit)
   pred_df <- NULL; balls_abs <- NULL; balls_pct <- NULL
   if (has_pred) {
-    if (layout == "vanilla") df <- df %>% dplyr::filter(col_lab != "p6")
-    pred_df <- df %>% dplyr::group_by(col_lab) %>% dplyr::group_split()
+    # Keep observed p6 data visible; preserve the existing aggregate-fit exclusion.
+    pred_source <- if (layout == "vanilla") dplyr::filter(df, col_lab != "p6") else df
+    pred_df <- pred_source %>% dplyr::group_by(col_lab) %>% dplyr::group_split()
     pred_df <- purrr::map_dfr(pred_df, function(grp){
       lab <- unique(grp$col_lab)
       dsub <- grp %>% dplyr::select(date, cum_n, target) %>% dplyr::distinct()
@@ -485,8 +506,8 @@ plot_timeline <- function(df, layout = c("vanilla","split"),
       
       preds
     })
-    balls_abs <- pred_df %>% dplyr::filter(finished_abs)
-    balls_pct <- pred_df %>% dplyr::filter(finished_pct)
+    balls_abs <- if (nrow(pred_df)) dplyr::filter(pred_df, finished_abs) else NULL
+    balls_pct <- if (nrow(pred_df)) dplyr::filter(pred_df, finished_pct) else NULL
   }
   
   # Ideal series (VISUAL ONLY):
@@ -556,8 +577,8 @@ plot_timeline <- function(df, layout = c("vanilla","split"),
         )
       })
     
-    balls_abs_ideal <- ideal_df %>% dplyr::filter(finished_abs)
-    balls_pct_ideal <- ideal_df %>% dplyr::filter(finished_pct)
+    balls_abs_ideal <- if (nrow(ideal_df)) dplyr::filter(ideal_df, finished_abs) else NULL
+    balls_pct_ideal <- if (nrow(ideal_df)) dplyr::filter(ideal_df, finished_pct) else NULL
   }
   
   # Aesthetics
@@ -572,7 +593,11 @@ plot_timeline <- function(df, layout = c("vanilla","split"),
   
   # Titles / captions
   main_title <- "Sample size over time via complete backbone datasets"
-  perc_sub_emp  <- "Top: absolute | Bottom: percent of integration target sample size"
+  perc_sub_emp  <- paste0(
+    "Top: absolute | Bottom: percent of integration target sample size",
+    if (any(df$project == 6 & df$sample == "adults")) " • p6 adults: cognitive tests only" else "",
+    if (any(is.na(df$target))) " • Unknown targets: no percentage" else ""
+  )
   perc_sub_pred <- paste0(
     perc_sub_emp,
     " \u2022 Shaded: 95% Newey\u2013West CI = \u0177\u0302 \u00B1 t\u2080.\u2089\u2087\u2085,df \u221A(x\u2032 V\u2099\u2093 x)"
@@ -602,12 +627,17 @@ plot_timeline <- function(df, layout = c("vanilla","split"),
     ggplot2::geom_vline(xintercept = as.numeric(ideal_cut),
                         linetype = "dashed", linewidth = ref_line_size, color = "grey40") else NULL
   
+  # Show a newly started series even when it contains only one observation date.
+  single_date <- df %>% dplyr::group_by(col_lab) %>%
+    dplyr::filter(dplyr::n_distinct(date) == 1L) %>% dplyr::ungroup()
+
   # Absolute panel
   y_top <- y_abs_limit
   if ((has_pred || has_ideal) && is.finite(y_top)) y_top <- y_top + 1
   
   p_abs <- ggplot2::ggplot() +
     ggplot2::geom_line(data = df, ggplot2::aes(x = date, y = cum_n, color = col_lab), linewidth = line_size) +
+    ggplot2::geom_point(data = single_date, ggplot2::aes(x = date, y = cum_n, color = col_lab), size = 1.8) +
     vline_cut + vline_goal_abs + vline_ref_abs +
     ggplot2::scale_x_date(breaks = breaks, labels = scales::label_date(format = "%d.%m.%Y"),
                           expand = ggplot2::expansion(mult = c(0, 0.01))) +
@@ -648,6 +678,7 @@ plot_timeline <- function(df, layout = c("vanilla","split"),
   # Percent panel
   p_pct <- ggplot2::ggplot() +
     ggplot2::geom_line(data = df, ggplot2::aes(x = date, y = pct, color = col_lab), linewidth = line_size) +
+    ggplot2::geom_point(data = single_date, ggplot2::aes(x = date, y = pct, color = col_lab), size = 1.8, na.rm = TRUE) +
     vline_cut + vline_goal_pct + vline_ref_pct +
     ggplot2::scale_x_date(breaks = breaks, labels = scales::label_date(format = "%d.%m.%Y"),
                           expand = ggplot2::expansion(mult = c(0, 0.01))) +

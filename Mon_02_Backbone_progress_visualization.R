@@ -1,7 +1,7 @@
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # Monitoring 2 — Visualize Backbone Progress
 # Authors: Saskia Wilken (saskia.wilken@uni-hamburg.de, saskia.a.wilken@gmail.com)
-# Updated: 2025-10-29
+# Updated: 2026-11-03
 #
 # RUN MON_01 first!
 #
@@ -11,6 +11,9 @@
 #       2) datasets missing questionnaire data  (=> cognitive present)
 #       3) datasets missing cognitive test data (=> questionnaires present)
 #  - Produces a progress plot (PNG) and a summary XLSX.
+#  - p6 adults require cognitive tests only (classified as complete by Mon_01).
+#    Their target must be specified separately as "p6 adults" in the split target
+#    sheet; until then it remains unknown, without using the existing p6 target.
 #
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -49,7 +52,7 @@ png_width <- 10; png_height <- 5; png_dpi <- 300
 
 # Toggle: one bar per project (default) vs per-sample bars
 per_sample_bars <- FALSE
-max_samples_per_project <- 2
+max_samples_per_project <- 3
 
 # Aesthetics
 outline_color <- "black"
@@ -132,6 +135,12 @@ n_complete <- count_by_ps(sheet_complete)
 n_miss_q   <- count_by_ps(sheet_miss_q)
 n_miss_c   <- count_by_ps(sheet_miss_c)
 
+# A new adult cohort must not inherit the target of the existing p6 cohorts.
+p6_adults_target <- targets_split %>%
+  dplyr::filter(project == 6, sample == "adults", is.finite(target), target > 0) %>%
+  dplyr::pull(target) %>% .[1]
+p6_adults_present <- any(n_complete$project == 6 & n_complete$sample == "adults")
+
 # ---- Build counts (project vs sample mode) ----
 if (per_sample_bars) {
   all_ps <- dplyr::bind_rows(n_complete[,1:2], n_miss_q[,1:2], n_miss_c[,1:2]) %>%
@@ -168,12 +177,16 @@ progress_counts <- progress_counts %>%
     n_has_cognitive     = n_complete + n_miss_q,  # <- used for "questionnaires missing" overlay
     project_id          = paste0("p", project),
     proj_target         = as.numeric(total_targets[project_id]),
-    sample_target       = proj_target
+    sample_target       = dplyr::case_when(
+      project == 6 & sample == "adults" ~ p6_adults_target,
+      project == 6 & sample == "ALL" & p6_adults_present & is.na(p6_adults_target) ~ NA_real_,
+      TRUE ~ proj_target
+    )
   )
 
 # ---- Special rule: p6 forced visual 33% + label "TBA / ?" ----
 progress_counts <- progress_counts %>%
-  dplyr::mutate(force_33 = project == 6)
+  dplyr::mutate(force_33 = project == 6 & sample != "adults")
 
 # ---- Percent-of-target (base for label position is COMPLETE) ----
 pctify <- function(n, target) ifelse(is.na(target) | target <= 0, NA_real_, pmin(100, 100*n/target))
@@ -263,7 +276,7 @@ label_df <- plot_df %>%
       TRUE                 ~ pmin(98, pmax(5, pct_for_label + 2))
     ),
     label = dplyr::case_when(
-      force_33             ~ "156 / ?",
+      force_33             ~ sprintf("%d / ?", n_complete),
       is.na(sample_target) ~ sprintf("%d / ?", n_complete),
       TRUE                 ~ sprintf("%d / %d (%.0f%%)", n_complete, sample_target, pct_for_label)
     )
@@ -286,7 +299,7 @@ summary_tbl <- progress_pct %>%
     target = dplyr::if_else(is.na(sample_target), "?", as.character(sample_target)),
     pct_complete = ifelse(is.na(sample_target) | force_33, NA, round(pctify(n_complete, sample_target),1)),
     label_for_plot = dplyr::case_when(
-      force_33             ~ "162 / ?",
+      force_33             ~ sprintf("%d / ?", n_complete),
       is.na(sample_target) ~ sprintf("%d / ?", n_complete),
       TRUE                 ~ sprintf("%d / %d (%.0f%%)", n_complete, sample_target, pctify(n_complete, sample_target))
     )
@@ -298,13 +311,13 @@ message("Saved table: ", normalizePath(output_xlsx))
 
 
 
-# ---- Second plot: split project 6 (children only; infants hidden) AND project 8 (children/adults) ----
-# Output name: same as original + "_split_p6_p8"; content no longer includes p6 infants.
+# ---- Second plot: split p6 children/adults (infants hidden) AND p8 children/adults ----
+# Output name remains "_split_p6_p8"; p6 infants stay hidden as before.
 output_png_split <- file.path(out_dir, sprintf("%s_project_progress_split_p6_p8.png", datestamp))
 
 # Helper: for split view
 # - p8 => keep "children"/"adults" using flexible matching
-# - p6 => keep ONLY rows where sample is exactly "children"; hide/drop all p6 infants/other p6 samples
+# - p6 => keep "children" and "adults"; hide/drop infants as before
 # - all others => "ALL"
 collapse_with_split_p6_p8 <- function(df_counts){
   if (!nrow(df_counts)) return(tibble::tibble(project=integer(), sample=character(), n=integer()))
@@ -315,6 +328,7 @@ collapse_with_split_p6_p8 <- function(df_counts){
         project == 8 & stringr::str_detect(sl, "adult") ~ "adults",
         project == 8 & stringr::str_detect(sl, "child") ~ "children",
         project == 6 & sl == "children"                 ~ "children",
+        project == 6 & sl == "adults"                   ~ "adults",
         project == 6                                    ~ NA_character_,
         TRUE                                            ~ "ALL"
       )
@@ -330,11 +344,11 @@ n_miss_c_s   <- collapse_with_split_p6_p8(n_miss_c)
 
 # Ensure rows for:
 # p2..p5, p7, p9 => "ALL"
-# p6 => "children" only; p6 infants are intentionally hidden in this split plot
+# p6 => "children" and "adults"; infants remain hidden in this split plot
 # p8 => "children" and "adults"
 base_rows <- tibble::tibble(
-  project = c(2:5, 6, 7, 8, 8, 9),
-  sample  = c(rep("ALL", 4), "children", "ALL", "children", "adults", "ALL")
+  project = c(2:5, 6, 6, 7, 8, 8, 9),
+  sample  = c(rep("ALL", 4), "children", "adults", "ALL", "children", "adults", "ALL")
 )
 
 progress_counts_split <- base_rows %>%
@@ -353,10 +367,11 @@ progress_counts_split <- base_rows %>%
   # Join per-(project,sample) targets from the P8_Split_P6.2_only sheet
   dplyr::left_join(targets_split, by = c("project","sample")) %>%
   dplyr::rename(sample_target = target) %>%
-  # Use sample target when available, else project target.
-  # No forced p6-infant display here because p6 infants are intentionally hidden.
+  # p6 adults use ONLY their own target; it may be added to the target sheet later.
+  # Preserve the existing project-target fallback for all other samples.
   dplyr::mutate(
-    sample_target = dplyr::coalesce(sample_target, proj_target),
+    sample_target = dplyr::if_else(project == 6 & sample == "adults",
+                                  sample_target, dplyr::coalesce(sample_target, proj_target)),
     force_33 = FALSE
   )
 
@@ -375,10 +390,10 @@ progress_pct_split <- progress_counts_split %>%
     pct_cmiss    = dplyr::if_else(force_33, 33, pct_cmiss)
   )
 
-# Axis labels: p2..p5, then "p6 children", then p7, "p8 children", "p8 adults", p9
+# Axis labels include the new p6 adults subproject.
 axis_levels_split <- c(
   axis_labels[paste0("p", 2:5)],
-  "p6 children",
+  "p6 children", "p6 adults",
   axis_labels["p7"],
   "p8 children", "p8 adults",
   axis_labels["p9"]
@@ -388,6 +403,7 @@ plot_df2 <- progress_pct_split %>%
   dplyr::mutate(
     project_lbl = dplyr::case_when(
       project == 6 & sample == "children" ~ "p6 children",
+      project == 6 & sample == "adults"   ~ "p6 adults",
       project == 8 & sample == "children" ~ "p8 children",
       project == 8 & sample == "adults"   ~ "p8 adults",
       TRUE                                ~ axis_labels[paste0("p", project)]
@@ -448,7 +464,7 @@ label_df2 <- plot_df2 %>%
       TRUE                 ~ pmin(98, pmax(5, pct_for_label + 2))
     ),
     label = dplyr::case_when(
-      force_33             ~ "162 / ?",
+      force_33             ~ sprintf("%d / ?", n_complete),
       is.na(sample_target) ~ sprintf("%d / ?", n_complete),
       TRUE                 ~ sprintf("%d / %d (%.0f%%)", n_complete, sample_target, pct_for_label)
     )
@@ -458,4 +474,4 @@ p2 <- p2 + geom_text(data = label_df2, aes(x = x, y = pct_pos, label = label),
                      inherit.aes = FALSE, hjust = 0, size = 3.4)
 
 ggsave(output_png_split, p2, width = png_width, height = png_height, dpi = png_dpi)
-message("Saved plot (p6 children only + p8 split): ", normalizePath(output_png_split))
+message("Saved plot (p6 children/adults + p8 split): ", normalizePath(output_png_split))
