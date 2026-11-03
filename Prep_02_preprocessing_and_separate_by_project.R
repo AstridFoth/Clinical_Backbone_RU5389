@@ -1192,6 +1192,101 @@ if (exists("earlier_2092_q")) rm(earlier_2092_q)
 dat_adults <- audit_id_change(dat_adults, dat_adults[[vp_col]] == 2097 & dat_adults[[project_col]] == PROJECT, vp_col, 20097, project_col, "adults", "questionnaire", "Project 2 questionnaire: missing zero/project-prefix format; VPID 2097 corrected to 20097.")
 
 
+# Project 2: FHS-Antworten von 29135 gehören zu 20135.
+# Nur die FHS-Items werden übertragen; anschließend wird die Zeile 29135 gelöscht.
+
+if (!all(c("Item", "Scale") %in% names(item_info_adults))) {
+  stop("FHS transfer: item_info_adults muss die Spalten 'Item' und 'Scale' enthalten.")
+}
+
+fhs_item_names <- trimws(as.character(item_info_adults$Item))
+fhs_scale_names <- trimws(as.character(item_info_adults$Scale))
+
+is_fhs_item <- !is.na(fhs_item_names) &
+  (
+    (!is.na(fhs_scale_names) & grepl("FHS", fhs_scale_names, ignore.case = TRUE)) |
+      grepl("^FHS", fhs_item_names, ignore.case = TRUE)
+  )
+
+fhs_items <- unique(fhs_item_names[is_fhs_item])
+fhs_items <- fhs_items[nzchar(fhs_items)]
+
+if (!length(fhs_items)) {
+  stop("FHS transfer: In item_info_adults wurden keine FHS-Items gefunden.")
+}
+
+missing_fhs_cols <- setdiff(fhs_items, names(dat_adults))
+if (length(missing_fhs_cols)) {
+  stop(
+    "FHS transfer: Diese gemappten FHS-Items fehlen in dat_adults: ",
+    paste(missing_fhs_cols, collapse = ", ")
+  )
+}
+
+project_num_adults <- suppressWarnings(
+  as.integer(as.character(dat_adults[[project_col]]))
+)
+
+idx_29135_fhs <- which(
+  dat_adults[[vp_col]] == 29135L &
+    project_num_adults == 2L
+)
+
+idx_20135_fhs <- which(
+  dat_adults[[vp_col]] == 20135L &
+    project_num_adults == 2L
+)
+
+
+# 20135 brach beim Ausfüllen ab. Der Neustart unter 29135 wurde erst ab dem
+# FHS ernsthaft beantwortet. Daher alle FHS-Antworten vollständig überschreiben,
+# auch wenn 20135 bereits Werte enthält oder 29135 einzelne fehlende Werte hat.
+# Bei nicht vorhandener Quellzeile gibt es nichts zu übertragen/löschen.
+if (length(idx_29135_fhs) > 0L) {
+  if (length(idx_29135_fhs) != 1L || length(idx_20135_fhs) != 1L) {
+    stop(
+      "FHS transfer: expected exactly one source row 29135 and one target row 20135 in Project 2; found ",
+      length(idx_29135_fhs), " source row(s) and ", length(idx_20135_fhs),
+      " target row(s). No FHS values transferred and no source row deleted."
+    )
+  }
+
+  for (item in fhs_items) {
+    dat_adults[[item]][idx_20135_fhs] <- dat_adults[[item]][idx_29135_fhs]
+  }
+
+  dat_adults <- audit_row_action(
+    dat_adults,
+    idx = seq_len(nrow(dat_adults)) == idx_20135_fhs,
+    id_col = vp_col,
+    project_col = project_col,
+    sample = "adults",
+    data_type = "questionnaire",
+    criterion = paste0(
+      "Project 2 questionnaire: after questionnaire 20135 crashed, session 29135 was answered seriously only from FHS onward. All mapped FHS responses in 20135 were overwritten with the responses from 29135 (including missing values): ",
+      paste(fhs_items, collapse = ", "), "."
+    ),
+    action = "fhs_overwritten",
+    new_id = 20135L
+  )
+
+  # Die Quellzeile ausschließlich nach erfolgreichem Transfer entfernen.
+  dat_adults <- audit_row_action(
+    dat_adults,
+    idx = seq_len(nrow(dat_adults)) == idx_29135_fhs,
+    id_col = vp_col,
+    project_col = project_col,
+    sample = "adults",
+    data_type = "questionnaire",
+    criterion = paste0(
+      "Project 2 questionnaire: FHS items (",
+      paste(fhs_items, collapse = ", "),
+      ") were transferred from VPID 29135 to VPID 20135; source row 29135 deleted."
+    ),
+    action = "deleted"
+  )
+}
+
 # Project 3 --------------------------------------------------------------------
 PROJECT <- 3
 
@@ -1218,6 +1313,36 @@ dat_adults <- audit_id_change(
   data_type = "questionnaire",
   criterion = "Project 3 questionnaire: known wrong VPID 31016 corrected to 32016."
 )
+
+# Resolve the original 32015 session BEFORE assigning 30016 to 32015.
+# The supplied questionnaire timestamp can be displayed in Berlin time or UTC.
+# Refuse an ambiguous match rather than changing two different sessions.
+idx_32015_p3_questionnaire_20241023 <- dat_adults[[vp_col]] == 32015L &
+  dat_adults[[project_col]] == PROJECT &
+  (
+    .fmt_time_berlin(dat_adults$startdate) == "2024-10-23 11:24:16" |
+      .questionnaire_time_matches_utc(
+        dat_adults,
+        "2024-10-23 11:24:16",
+        time_cols = "startdate"
+      )
+  )
+
+if (sum(idx_32015_p3_questionnaire_20241023, na.rm = TRUE) > 1L) {
+  stop("Project 3 questionnaire: ambiguous match for original VPID 32015 at 2024-10-23 11:24:16 (Berlin/UTC).")
+}
+
+dat_adults <- audit_id_change(
+  dat_adults,
+  idx = idx_32015_p3_questionnaire_20241023,
+  id_col = vp_col,
+  new_id = 30015L,
+  project_col = project_col,
+  sample = "adults",
+  data_type = "questionnaire",
+  criterion = "Project 3 questionnaire: original VPID 32015 at 2024-10-23 11:24:16 (Berlin or UTC display) corrected to 30015 before the separate 30016-to-32015 correction."
+)
+rm(idx_32015_p3_questionnaire_20241023)
 
 dat_adults <- audit_id_change(
   dat_adults,
@@ -1345,30 +1470,6 @@ dat_adults <- audit_id_change(dat_adults, dat_adults[[vp_col]] == 4033 & dat_adu
 dat_adults <- audit_id_change(dat_adults, dat_adults[[id_col]] == 630 & dat_adults[[project_col]] == PROJECT, vp_col, 40016, project_col, "adults", "questionnaire", "Project 4 questionnaire: LimeSurvey response id 630 known to belong to VPID 40016.")
 
 
-# Project 5 assignment correction -----------------------------------------------
-# VPID 50056 is valid. Only the project assignment was wrong:
-# project 8 -> project 5. The VPID stays 50056.
-PROJECT <- 5
-
-idx_50056_p5_questionnaire <- dat_adults[[vp_col]] == 50056L &
-  dat_adults[[project_col]] == 8L
-
-dat_adults <- audit_row_action(
-  dat_adults,
-  idx = idx_50056_p5_questionnaire,
-  id_col = vp_col,
-  project_col = project_col,
-  sample = "adults",
-  data_type = "questionnaire",
-  criterion = "Project assignment correction: VPID 50056 is valid and belongs to Project 5, not Project 8; VPID kept unchanged.",
-  action = "project_changed"
-)
-
-if (any(idx_50056_p5_questionnaire, na.rm = TRUE)) {
-  dat_adults[[project_col]][idx_50056_p5_questionnaire] <- PROJECT
-}
-rm(idx_50056_p5_questionnaire)
-
 # Project 7 --------------------------------------------------------------------
 PROJECT <- 7
 
@@ -1403,6 +1504,18 @@ dat_adolescents <- audit_id_change(
 
 # Project 8 --------------------------------------------------------------------
 PROJECT <- 8
+
+# agecalc is not applicable to A-forms in the children/parents sample.
+# Use R's standard missing value, consistent with the imported/exported data.
+if (!all(c("project", "form", "agecalc") %in% names(dat_children_parents))) {
+  stop("Project 8 agecalc correction: expected columns project, form and agecalc in children_parents.")
+}
+idx_p8_form_a_agecalc <- which(
+  dat_children_parents$project == PROJECT &
+    dat_children_parents$form == "A"
+)
+dat_children_parents$agecalc[idx_p8_form_a_agecalc] <- NA
+rm(idx_p8_form_a_agecalc)
 
 dat_children_parents <- audit_id_change(
   dat_children_parents,
@@ -1625,6 +1738,21 @@ dat_children_parents <- dat_children_parents %>%
 
 
 # Project 7 --------------------------------------------------------------------
+# VPID 70084: only the second adolescent questionnaire from 2025-07-04 is
+# invalid. Retain the earlier valid questionnaire and the main-study status.
+dat_adolescents <- audit_row_action(
+  dat_adolescents,
+  idx = dat_adolescents[[project_col]] == 7L &
+    dat_adolescents[[vp_col]] == 70084L &
+    .date_berlin(dat_adolescents$startdate) == as.Date("2025-07-04"),
+  id_col = "vpid",
+  project_col = "project",
+  sample = "adolescents",
+  data_type = "questionnaire",
+  criterion = "Project 7 questionnaire adolescents: invalid second recording for VPID 70084 with startdate on 2025-07-04 deleted; the earlier valid session was retained.",
+  action = "deleted"
+)
+
 # VPID 70088: keep the first adolescent session from 2025-06-24. The later
 # session was an accidental restart of the questionnaire.
 dat_adolescents <- audit_row_action(
@@ -2060,7 +2188,9 @@ add_invariant_idas_flag <- function(df, sample, item_info = item_info_adults) {
   )
   
   invariant <- apply(idas_values, 1, function(x) {
-    length(unique(x)) == 1L
+    # Straightlining requires observed answers on every IDAS item.
+    # Missing/blank responses are handled by missingness checks, not this flag.
+    all(!is.na(x) & nzchar(trimws(x))) && length(unique(x)) == 1L
   })
   
   df$idas_invariant_response_flag <- as.logical(invariant)
@@ -2311,6 +2441,21 @@ psytool_info_adults <- audit_id_change(
   criterion = "Project 3 cogtests: known wrong ID 31016 corrected to 32016."
 )
 
+# Match the original 32015 cogtest on the questionnaire's collection date.
+# Apply this first so the separate 30016-to-32015 correction is preserved.
+psytool_info_adults <- audit_id_change(
+  psytool_info_adults,
+  idx = psytool_info_adults$id == 32015L &
+    psytool_info_adults$p == PROJECT &
+    .date_berlin(psytool_info_adults$TIME_start) == as.Date("2024-10-23"),
+  id_col = "id",
+  new_id = 30015L,
+  project_col = "p",
+  sample = "adults",
+  data_type = "experiment_data",
+  criterion = "Project 3 cogtests: ID 32015 with TIME_start on 2024-10-23 corrected to 30015."
+)
+
 psytool_info_adults <- audit_id_change(
   psytool_info_adults,
   idx = psytool_info_adults[[vp_col]] == 30016L &
@@ -2443,29 +2588,20 @@ psytool_info_adults <- audit_id_change(psytool_info_adults, psytool_info_adults[
 psytool_info_adults <- audit_id_change(psytool_info_adults, psytool_info_adults[[vp_col]] == 4003 & psytool_info_adults[[project_col]] == PROJECT, vp_col, 40003, project_col, "adults", "experiment_data", "Project 4 cogtests: missing zero/project-prefix format; ID 4003 corrected to 40003.")
 
 
-# Project 5 assignment correction -----------------------------------------------
-# ID 50056 is valid. Only the project assignment was wrong:
-# p 8 -> p 5. The ID stays 50056.
-PROJECT <- 5
-
-idx_50056_p5_cog <- psytool_info_adults[[vp_col]] == 50056L &
-  psytool_info_adults[[project_col]] == 8L
-
-psytool_info_adults <- audit_row_action(
+# Project 8 cogtests: correct only the mistyped ID for this dated session.
+# The existing project assignment p = 8 is correct and stays unchanged.
+psytool_info_adults <- audit_id_change(
   psytool_info_adults,
-  idx = idx_50056_p5_cog,
+  idx = psytool_info_adults[[vp_col]] == 50056L &
+    psytool_info_adults[[project_col]] == 8L &
+    .date_berlin(psytool_info_adults$TIME_start) == as.Date("2026-02-03"),
   id_col = vp_col,
+  new_id = 80056L,
   project_col = project_col,
   sample = "adults",
   data_type = "experiment_data",
-  criterion = "Project assignment correction: ID 50056 is valid and belongs to Project 5, not Project 8; ID kept unchanged.",
-  action = "project_changed"
+  criterion = "Project 8 cogtests: ID 50056 with TIME_start on 2026-02-03 corrected to 80056; the correct project assignment p = 8 was retained."
 )
-
-if (any(idx_50056_p5_cog, na.rm = TRUE)) {
-  psytool_info_adults[[project_col]][idx_50056_p5_cog] <- PROJECT
-}
-rm(idx_50056_p5_cog)
 
 # Project 8 --------------------------------------------------------------------
 PROJECT <- 8

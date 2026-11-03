@@ -19,6 +19,13 @@
 # Revision 2026-10-12: all P3/P4/P5 participants are forced to No_Diagnosis,
 # with an empty Diagnosis_Group, independently of grouping-workbook entries.
 #
+# Revision 2026-11-03: compact exclusion overviews (combined and per project),
+# raw CAPS straightlining for P8 and numeric CBCL straightlining for P6.
+# Child/parent exports receive these exclusions without adult scoring/imputation.
+# Measurement-date columns (Scale == date in Item Information) are removed only
+# after age derivation, from clean AND discarded outputs and exported keys.
+# Exclusion workbooks also document formulas, item sets and run-specific cutoffs.
+#
 # IMPORTANT:
 # - This script does NOT compute score_* columns.
 # - Scoring is moved to a later script so internal consistency can run in between.
@@ -682,6 +689,54 @@ make_participant_exclusion_key <- function(df, id_col = find_participant_id_col(
   )
 }
 
+# Only these CBCL symptom response fields enter the P6 straightlining check.
+# Free-text follow-ups (e.g. CBCL36a, CBCL63d1) and competence items stay out,
+# even when a free-text answer happens to contain digits.
+CBCL_INVARIANT_ITEMS <- c(
+  unlist(lapply(list(c(17,26), c(27,36), c(37,47), c(48,53), c(54,62)), function(z) {
+    paste0("CBCL", z[1], "to", z[2], "[CBCL", seq.int(z[1], z[2]), "]")
+  }), use.names = FALSE),
+  paste0("CBCL63x[CBCL63", letters[1:4], "]"),
+  paste0("CBCL63y[CBCL63", letters[5:8], "]"),
+  unlist(lapply(list(c(64,65), c(66,73), c(74,77), c(78,80), c(81,84),
+                    c(85,86), c(87,90), c(91,92), c(93,99), c(100,107),
+                    c(108,112), c(113,119)), function(z) {
+    paste0("CBCL", z[1], "to", z[2], "[CBCL", seq.int(z[1], z[2]), "]")
+  }), use.names = FALSE)
+)
+CAPS_INVARIANT_ITEMS <- sprintf("CAPS[CAPS%03d]", seq_len(22L))
+CHILD_PARENT_SAMPLES <- c("children_parents", "parents_p6", "children_p6")
+
+raw_invariant_response <- function(df, items, eligible, label, sample) {
+  flagged <- rep(FALSE, nrow(df))
+  eligible[is.na(eligible)] <- FALSE
+  if (!any(eligible)) return(flagged)
+  cols <- names(df)[match(normalize_id(items), normalize_id(names(df)))]
+  if (all(is.na(cols))) {
+    log_msg("Sample '", sample, "': no raw ", label,
+            " response fields in this export; no local straightlining check.")
+    return(flagged)
+  }
+  # read_questionnaire() drops completely empty columns. If an entire item
+  # column is absent, no row can meet the complete-all-items criterion.
+  if (anyNA(cols)) {
+    log_msg("Sample '", sample, "': incomplete raw ", label,
+            " item set; no row flagged for identical responses across all items. Missing: ",
+            paste(items[is.na(cols)], collapse = ", "))
+    return(flagged)
+  }
+  values <- as.matrix(as.data.frame(lapply(df[eligible, cols, drop = FALSE], function(x) {
+    suppressWarnings(as.numeric(trimws(as.character(x))))
+  })))
+  flagged[eligible] <- apply(values, 1L, function(x) {
+    length(x) >= 2L && all(is.finite(x) & x >= 0) && length(unique(x)) == 1L
+  })
+  log_msg("Sample '", sample, "': checked ", length(cols), " raw ", label,
+          " items before reverse coding/imputation; ", sum(flagged),
+          " invariant row(s). All items must have an observed numeric answer.")
+  flagged
+}
+
 remove_flagged_rows <- function(q_df, sample) {
   as_flag_logical <- function(x) {
     if (is.logical(x)) return(dplyr::coalesce(x, FALSE))
@@ -705,13 +760,34 @@ remove_flagged_rows <- function(q_df, sample) {
     as_flag_logical(q_df[[rushing_col]])
   }
 
-  idas_flag <- if (is.na(idas_col)) {
+  idas_flag <- if (!(sample %in% c("adults", "adolescents")) || is.na(idas_col)) {
     rep(FALSE, nrow(q_df))
   } else {
     as_flag_logical(q_df[[idas_col]])
   }
 
-  directly_flagged <- rushing_flag | idas_flag
+  project_col <- get_project_col(q_df)
+  project <- if (is.null(project_col)) rep(NA_character_, nrow(q_df)) else
+    normalize_project_key(q_df[[project_col]])
+  caps_flag <- cbcl_flag <- rep(FALSE, nrow(q_df))
+  if (sample %in% CHILD_PARENT_SAMPLES) {
+    caps_flag <- raw_invariant_response(
+      q_df, CAPS_INVARIANT_ITEMS, sample == "children_parents" & project == "p8",
+      "CAPS", sample
+    )
+    cbcl_flag <- raw_invariant_response(
+      q_df, CBCL_INVARIANT_ITEMS, project == "p6", "CBCL", sample
+    )
+  }
+  direct_reason <- vapply(seq_len(nrow(q_df)), function(i) {
+    paste(c(
+      if (rushing_flag[i]) "rushing_flag",
+      if (idas_flag[i]) "same_response_on_all_raw_IDAS_items",
+      if (caps_flag[i]) "same_response_on_all_raw_CAPS_items",
+      if (cbcl_flag[i]) "same_response_on_all_raw_numeric_CBCL_items"
+    ), collapse = "; ")
+  }, character(1))
+  directly_flagged <- rushing_flag | idas_flag | caps_flag | cbcl_flag
   id_col <- find_participant_id_col(q_df)
   participant_key <- make_participant_exclusion_key(q_df, id_col)
   flagged_participant_keys <- unique(
@@ -726,16 +802,16 @@ remove_flagged_rows <- function(q_df, sample) {
 
   discarded <- q_df[remove_row, , drop = FALSE]
   if (nrow(discarded)) {
-    discarded$.__reason__ <- dplyr::case_when(
-      directly_flagged[remove_row] & rushing_flag[remove_row] & idas_flag[remove_row] ~
-        "rushing_flag_and_same_response_on_all_raw_IDAS_items",
-      directly_flagged[remove_row] & rushing_flag[remove_row] ~ "rushing_flag",
-      directly_flagged[remove_row] & idas_flag[remove_row] ~
-        "same_response_on_all_raw_IDAS_items",
-      same_flagged_participant[remove_row] ~
-        "same_participant_as_rushing_or_IDAS_flagged_row",
-      TRUE ~ "flagged_for_exclusion"
-    )
+    reason <- direct_reason
+    for (i in which(remove_row & !directly_flagged)) {
+      source_reasons <- unique(direct_reason[
+        directly_flagged & !is.na(participant_key) &
+          participant_key == participant_key[i]
+      ])
+      reason[i] <- paste0("same_participant_as_flagged_row; ",
+                          paste(source_reasons, collapse = "; "))
+    }
+    discarded$.__reason__ <- reason[remove_row]
   }
 
   clean <- q_df[!remove_row, , drop = FALSE]
@@ -749,6 +825,8 @@ remove_flagged_rows <- function(q_df, sample) {
   sum(remove_row & !directly_flagged),
   "; rushing: ", sum(rushing_flag),
   "; invariant IDAS responding: ", sum(idas_flag),
+  "; invariant CAPS responding: ", sum(caps_flag),
+  "; invariant numeric CBCL responding: ", sum(cbcl_flag),
   "; both: ", sum(rushing_flag & idas_flag), ").")
 
   if (any(directly_flagged & is.na(participant_key))) {
@@ -768,6 +846,36 @@ remove_flagged_rows <- function(q_df, sample) {
   )
 }
 
+# P6 CBCL is collected in parents_p6. Remove the matching participant's other
+# child/parent records too, using project + ID, never the ID's first digit.
+propagate_p6_cbcl_exclusions <- function(dropped_by_sample) {
+  child_samples <- intersect(CHILD_PARENT_SAMPLES, names(dropped_by_sample))
+  cbcl_keys <- unique(unlist(lapply(child_samples, function(sample) {
+    dd <- dropped_by_sample[[sample]]$discarded
+    if (!nrow(dd)) return(character(0))
+    key <- make_participant_exclusion_key(dd)
+    key[!is.na(key) & startsWith(key, "p6::") &
+          grepl("same_response_on_all_raw_numeric_CBCL_items", dd$.__reason__, fixed = TRUE)]
+  }), use.names = FALSE))
+  if (!length(cbcl_keys)) return(dropped_by_sample)
+  for (sample in child_samples) {
+    dropped <- dropped_by_sample[[sample]]
+    key <- make_participant_exclusion_key(dropped$clean)
+    remove <- !is.na(key) & key %in% cbcl_keys
+    extra <- dropped$clean[remove, , drop = FALSE]
+    if (nrow(extra)) {
+      extra$.__reason__ <- "same_participant_as_P6_CBCL_flagged_row; same_response_on_all_raw_numeric_CBCL_items"
+      dropped$discarded <- dplyr::bind_rows(dropped$discarded, extra)
+      dropped$clean <- dropped$clean[!remove, , drop = FALSE]
+      log_msg("Sample '", sample, "': excluded ", nrow(extra),
+              " additional row(s) through the participant's P6 CBCL responses.")
+    }
+    dropped$excluded_participant_keys <- union(dropped$excluded_participant_keys, cbcl_keys)
+    dropped_by_sample[[sample]] <- dropped
+  }
+  dropped_by_sample
+}
+
 assert_flagged_participants_absent <- function(clean_df, dropped, sample) {
   excluded_keys <- dropped$excluded_participant_keys
   if (is.null(excluded_keys) || !length(excluded_keys)) {
@@ -785,7 +893,7 @@ assert_flagged_participants_absent <- function(clean_df, dropped, sample) {
     stop(
       "Exclusion integrity check failed for sample '", sample, "': ",
       length(overlap),
-      " participant key(s) flagged for rushing or invariant IDAS responding ",
+      " participant key(s) flagged for a quality exclusion ",
       "are still present in the cleaned master. No outputs were written for ",
       "this sample. Affected key(s): ", paste(overlap, collapse = ", ")
     )
@@ -794,8 +902,8 @@ assert_flagged_participants_absent <- function(clean_df, dropped, sample) {
   log_msg(
     "Exclusion check for sample '", sample, "': all ",
     length(excluded_keys),
-    " identified participant(s) flagged for rushing or invariant IDAS ",
-    "responding are absent from the cleaned master."
+    " identified participant(s) flagged for a quality exclusion ",
+    "are absent from the cleaned master."
   )
   invisible(TRUE)
 }
@@ -1174,6 +1282,9 @@ filter_and_impute_global_scored_items <- function(df,
   n_nonmiss <- rowSums(!is.na(M))
   n_total <- length(item_cols)
   min_required <- ceiling(min_prop_items * n_total)
+  # Retain the exact denominator/item set used here for the methods export.
+  missingness_audit <- list(item_cols = item_cols, n_total = n_total,
+                           min_prop_items = min_prop_items, min_required = min_required)
   
   keep <- n_nonmiss >= min_required
   
@@ -1192,7 +1303,10 @@ filter_and_impute_global_scored_items <- function(df,
           min_required, "/", n_total, " scorable items.")
   
   if (!nrow(clean)) {
-    stop("Global missingness filter removed all rows for sample '", sample, "'.")
+    log_msg("Global missingness filter: no retained rows for sample '", sample,
+            "'; exporting the empty clean table and all exclusion reasons.")
+    return(list(clean = clean, discarded = discarded, imputation_log = tibble::tibble(),
+                missingness_audit = missingness_audit))
   }
   
   imputation_log <- purrr::map_dfr(item_cols, function(cc) {
@@ -1219,7 +1333,8 @@ filter_and_impute_global_scored_items <- function(df,
   log_msg("Global item imputation for sample '", sample, "': imputed ",
           n_imp, " remaining missing scorable item cells by item median.")
   
-  list(clean = clean, discarded = discarded, imputation_log = imputation_log)
+  list(clean = clean, discarded = discarded, imputation_log = imputation_log,
+       missingness_audit = missingness_audit)
 }
 
 # ---- Export helpers ----------------------------------------------------------
@@ -1265,14 +1380,178 @@ rename_master_item_columns_inplace <- function(df, item_info = NULL, preserve_sc
   list(df = df, map = map_tbl)
 }
 
+measurement_date_items <- function(item_info) {
+  if (is.null(item_info) || !all(c("item", "scale") %in% names(item_info))) {
+    stop("Item Information is required to identify measurement-date output columns.")
+  }
+  unique(as.character(item_info$item[
+    !is.na(item_info$scale) & normalize_scale_chr(item_info$scale) == "DATE"
+  ]))
+}
+
+remove_measurement_dates <- function(df, item_info, sample, output_label) {
+  date_items <- measurement_date_items(item_info)
+  remove <- normalize_id(names(df)) %in% normalize_id(date_items)
+  if (any(remove)) {
+    log_msg("Sample '", sample, "': removed ", sum(remove), " measurement-date column(s) from ",
+            output_label, " using Item Information (Scale=date): ",
+            paste(names(df)[remove], collapse = ", "))
+  }
+  df[, !remove, drop = FALSE]
+}
+
+build_exclusion_overview <- function(df, sample) {
+  if (!nrow(df)) return(tibble::tibble(
+    vp_id = character(), project = character(), sample = character(),
+    forms = character(), n_excluded_rows = integer(), reason = character()
+  ))
+  id_col <- find_participant_id_col(df)
+  project_col <- get_project_col(df)
+  form_col <- names(df)[tolower(names(df)) == "form"]
+  id <- if (is.null(id_col)) rep(NA_character_, nrow(df)) else normalize_vpid(df[[id_col]])
+  project <- if (is.null(project_col)) rep(NA_character_, nrow(df)) else
+    normalize_project_key(df[[project_col]])
+  id[is.na(id) | id == ""] <- NA_character_
+  reason <- if (".__reason__" %in% names(df)) as.character(df$.__reason__) else
+    rep("unspecified_exclusion", nrow(df))
+  tibble::tibble(
+    vp_id = id, project = project, sample = sample,
+    forms = if (length(form_col)) as.character(df[[form_col[1]]]) else NA_character_,
+    reason = reason,
+    .row_key = ifelse(is.na(id), paste0("missing_id_row_", seq_len(nrow(df))), id)
+  ) %>%
+    dplyr::group_by(.data$project, .data$sample, .data$.row_key) %>%
+    dplyr::summarise(
+      vp_id = dplyr::first(.data$vp_id),
+      forms = paste(sort(unique(.data$forms[!is.na(.data$forms)])), collapse = ", "),
+      n_excluded_rows = dplyr::n(),
+      reason = paste(unique(.data$reason), collapse = " | "),
+      .groups = "drop"
+    ) %>%
+    dplyr::select(vp_id, project, sample, forms, n_excluded_rows, reason)
+}
+
+build_exclusion_documentation <- function(sample, input_date, item_info,
+                                          audit_input = NULL, missingness_audit = NULL,
+                                          questionnaire_path = NULL, iteminfo_path = NULL) {
+  # Descriptions distinguish flags imported from Step 02 from criteria actually
+  # computed here. Rushing cutoffs below are copied from the input, not refitted.
+  criteria <- tibble::tribble(
+    ~criterion, ~scope, ~calculation, ~missing_handling, ~stage, ~exclusion_unit, ~source,
+    "rushing_flag", "All processed samples with an imported rushing_flag",
+    "t = interviewtime_seconds/60; x = ln(t). Flag if x < cutoff_log (strict inequality). Combined adults+adolescents: cutoff_log = mean(x)-2*SD(x). Single-sample fallback: N>=100 -> mean(x)-2*SD(x); N<100 -> median(x)-1.5*IQR(x). cutoff_minutes = exp(cutoff_log). Use the imported rushing_method to identify the actual branch.",
+    "Step 02 uses only non-missing positive durations for threshold estimation and excludes project buckets 0, 99, unknown from that reference. Missing/non-positive durations are not flagged. With <2 valid reference rows the analysis is skipped. IQR uses R's default quantiles (type 7); SD is the sample SD.",
+    "Flag calculated in Step 02; applied before item recoding in Step 03",
+    "All rows with the same project + normalized participant ID within the sample",
+    "Step 02; functions/analyze_rushing.R; actual method/center/cutoff from input columns",
+    "same_response_on_all_raw_IDAS_items", "Adults and adolescents",
+    "Imported idas_invariant_response_flag. Step 02 selects all IDAS[digits] items from Item Information Adults. For character raw-item response vector x, the flag is all(!is.na(x) & nzchar(trimws(x))) && length(unique(x)) == 1: all items must have observed, non-blank answers and exactly one unique response, before reverse coding or imputation. No IDAS flag is recalculated in Step 03.",
+    "Any NA or blank/whitespace-only response prevents the IDAS straightlining flag, including rows with every IDAS item missing. Such rows remain eligible for the separate global missingness exclusion. A missing flag column is treated as FALSE in Step 03. Rerun corrected Step 02 to refresh flags in older input exports.",
+    "Flag calculated in Step 02; applied before item recoding in Step 03",
+    "All rows with the same project + normalized participant ID within the sample",
+    "Step 02; add_invariant_idas_flag() in Prep_02_preprocessing_and_separate_by_project.R",
+    "same_response_on_all_raw_CAPS_items", "P8; children_parents",
+    "All 22 CAPS[CAPS001]...CAPS[CAPS022] responses must parse as numeric, be finite and >=0, and have exactly one unique value. Tested on raw responses before reverse coding or imputation.",
+    "Any missing/non-numeric/negative/non-finite item prevents the flag. If any required item column is absent, no row is flagged by this criterion; this is logged.",
+    "Step 03, before item processing", "All rows/forms with the same project + normalized participant ID within children_parents",
+    "Step 03; raw_invariant_response(); CAPS_INVARIANT_ITEMS",
+    "same_response_on_all_raw_numeric_CBCL_items", "P6; available child/parent samples, including parents_p6",
+    "All 110 explicitly listed symptom response fields must parse as numeric, be finite and >=0, and have exactly one unique value. The fixed list covers the user-specified CBCL17...CBCL119 fields, with CBCL63a...h replacing CBCL63. Free-text follow-ups and competence fields are excluded even if their text contains digits.",
+    "Any missing/non-numeric/negative/non-finite response in a required field prevents the flag. Missing item columns prevent this check and are logged. Free-text fields outside the fixed list never enter the calculation.",
+    "Step 03, before item processing", "All matching P6 project + normalized participant ID rows across available children_parents, parents_p6 and children_p6 exports",
+    "Step 03; raw_invariant_response(); CBCL_INVARIANT_ITEMS; propagate_p6_cbcl_exclusions()",
+    "global_missingness", "Adults and adolescents only; remaining rows after quality exclusions",
+    "M = number of unique scorable columns selected by Item Information and Scoring, always including SUQ, excluding NON_SCORABLE_SCALES. k = number of non-NA numeric responses in the row. Exclude if k < ceiling(min_prop_items*M); min_prop_items defaults to 0.50. The exact M, minimum k and item set for this run are recorded in run_parameters/item_sets.",
+    "Numeric coercion precedes counting; non-numeric values become NA. After exclusions, remaining missing values are filled with the item median across retained rows of that sample; this imputation is not itself an exclusion criterion.",
+    "After reverse coding and CAPE/SUQ-specific recoding/filling; before global item-median imputation",
+    "Row-wise; unlike quality flags, this filter does not propagate to other rows of the same ID",
+    "Step 03; filter_and_impute_global_scored_items()",
+    "same_participant_as_flagged_row / same_participant_as_P6_CBCL_flagged_row", "Rows linked to a directly flagged record",
+    "Propagation of an existing quality exclusion via project + normalized participant ID. This is not an additional independent quality criterion. ID normalization lowercases and removes characters outside a-z/0-9; no ID-prefix project inference is used.",
+    "Rows without a usable participant ID can only be removed directly; they cannot be linked to other rows.",
+    "After quality flags; P6 CBCL linkage also runs across the available child/parent samples",
+    "Linked rows; source criterion remains included in the reason field",
+    "Step 03; make_participant_exclusion_key(); remove_flagged_rows(); propagate_p6_cbcl_exclusions()"
+  )
+  input_names <- if (is.null(audit_input)) character() else names(audit_input)
+  value_string <- function(x) {
+    if (is.null(x) || !length(x)) return(NA_character_)
+    paste(as.character(x), collapse = "; ")
+  }
+  parameters <- list(
+    documentation_version = "2026-11-03",
+    sample = sample, download_date = input_date,
+    questionnaire_file = if (is.null(questionnaire_path)) NULL else basename(questionnaire_path),
+    item_information_file = if (is.null(iteminfo_path)) NULL else basename(iteminfo_path),
+    n_input_rows = if (is.null(audit_input)) NULL else nrow(audit_input),
+    rushing_flag_column_found = any(input_names %in% c("rushing_flag", "rushingflag")),
+    idas_flag_column_found = any(input_names %in% c("idas_invariant_response_flag", "idasinvariantresponseflag")),
+    global_missingness_executed = !is.null(missingness_audit),
+    global_minimum_proportion = missingness_audit$min_prop_items,
+    global_number_of_items = missingness_audit$n_total,
+    global_minimum_answered_items = missingness_audit$min_required,
+    global_excluded_scales = NON_SCORABLE_SCALES,
+    coverage = "Step 03 only. Records already removed in earlier pipeline steps are not included in this overview.",
+    exclusion_order = "Quality flags and participant linkage -> item-specific processing -> global missingness (adults/adolescents) -> global median imputation -> export.",
+    flag_interpretation = "Step 03: logical TRUE; any non-missing nonzero numeric flag; character true/t/1/yes/y after trimming and lowercasing. Absent flag columns are FALSE.",
+    upstream_reference_n = "Not stored in the imported rushing columns; not reconstructed from a project subset. The imported center and cutoff are preserved exactly; see Step 02 statistics/histograms for its reference N.",
+    item_set_note = "IDAS item list below is the current Item Information list, not a stored historical Step 02 item manifest. CAPS/CBCL lists and global missingness columns reflect this run's exact Step 03 definitions."
+  )
+  run_parameters <- tibble::tibble(
+    parameter = names(parameters), value = vapply(parameters, value_string, character(1))
+  )
+  item_sets <- list(
+    same_response_on_all_raw_IDAS_items = if (sample %in% c("adults", "adolescents"))
+      unique(as.character(item_info$item[grepl("^IDAS\\[[0-9]+\\]$", trimws(item_info$item))])) else character(),
+    same_response_on_all_raw_CAPS_items = if (sample == "children_parents") CAPS_INVARIANT_ITEMS else character(),
+    same_response_on_all_raw_numeric_CBCL_items = if (sample %in% CHILD_PARENT_SAMPLES) CBCL_INVARIANT_ITEMS else character(),
+    global_missingness = missingness_audit$item_cols
+  )
+  item_sets <- dplyr::bind_rows(lapply(names(item_sets), function(criterion) {
+    items <- item_sets[[criterion]]
+    tibble::tibble(criterion = rep(criterion, length(items)), item = as.character(items),
+                  present_in_input = normalize_id(items) %in% normalize_id(input_names))
+  }))
+  # Keep numeric center/cutoff values as numeric XLSX cells, with full precision.
+  get_col <- function(token, numeric = FALSE) {
+    hit <- match(normalize_id(token), normalize_id(input_names))
+    x <- if (is.na(hit)) rep(NA_character_, if (is.null(audit_input)) 0L else nrow(audit_input)) else
+      as.character(audit_input[[hit]])
+    if (numeric) suppressWarnings(as.numeric(x)) else x
+  }
+  rushing_parameters <- tibble::tibble(
+    method = get_col("rushing_method"),
+    center_minutes = get_col("rushing_center_min", TRUE),
+    cutoff_minutes = get_col("rushing_cutoff_min", TRUE)
+  ) %>% dplyr::distinct()
+  rushing_parameters <- rushing_parameters[
+    !is.na(rushing_parameters$method) | !is.na(rushing_parameters$cutoff_minutes), , drop = FALSE
+  ]
+  list(criteria = criteria, run_parameters = run_parameters,
+       item_sets = item_sets, rushing_parameters = rushing_parameters)
+}
+
 export_per_project <- function(df_clean,
                                df_discard,
                                sample,
                                input_date,
-                               item_info = NULL) {
+                               item_info = NULL,
+                               audit_input = NULL,
+                               missingness_audit = NULL,
+                               questionnaire_path = NULL,
+                               iteminfo_path = NULL) {
   out_dir <- fs::path(DIR_EXPORT, sample)
   fs::dir_create(out_dir)
   
+  # Also sanitize direct callers of this writer; the driver strips dates after
+  # age derivation so returned objects and keys agree with the exported files.
+  df_clean <- remove_measurement_dates(df_clean, item_info, sample, "clean export")
+  df_discard <- remove_measurement_dates(df_discard, item_info, sample, "discarded export")
+  overview <- build_exclusion_overview(df_discard, sample)
+  documentation <- build_exclusion_documentation(
+    sample, input_date, item_info, audit_input, missingness_audit,
+    questionnaire_path, iteminfo_path
+  )
   ren <- rename_master_item_columns_inplace(df_clean, item_info = item_info)
   df_clean <- ren$df
   map_tbl  <- ren$map
@@ -1299,20 +1578,35 @@ export_per_project <- function(df_clean,
   log_msg("Wrote master (items only, no score columns): ", master_path)
   log_msg("Wrote discarded: ", disc_path)
   
-  proj_col <- get_project_col(df_clean)
-  if (is.null(proj_col)) {
-    log_msg("No project column ('project' or 'p') — skipping per-project split.")
-    return(invisible(NULL))
+  overview_path <- fs::path(out_dir, glue::glue("{input_date}_{sample}_exclusions.xlsx"))
+  writexl::write_xlsx(c(list(exclusions = overview), documentation), overview_path)
+  log_msg("Wrote exclusion overview: ", overview_path,
+          " (", nrow(overview), " participant entry/entries; ", nrow(df_discard), " row(s)).")
+  log_msg("Included methods sheets: criteria, run_parameters, item_sets, rushing_parameters.")
+  for (i in seq_len(nrow(overview))) {
+    log_msg("Excluded vpid ", overview$vp_id[i], " (project=", overview$project[i],
+            ", sample=", sample, ", forms=", overview$forms[i],
+            ", rows=", overview$n_excluded_rows[i], "): ", overview$reason[i])
   }
-  
-  df_split <- split(df_clean, df_clean[[proj_col]])
-  purrr::iwalk(df_split, function(dd, proj) {
-    project_key <- normalize_project_key(proj)
-    if (is.na(project_key) || !grepl("^p[0-9]+$", project_key)) {
-      warning("Cannot assign project-specific export to a project folder: ", proj,
-              ". These rows remain in the combined clean master.", call. = FALSE)
-      return(invisible(NULL))
-    }
+
+  clean_proj_col <- get_project_col(df_clean)
+  discard_proj_col <- get_project_col(df_discard)
+  clean_proj <- if (is.null(clean_proj_col)) rep(NA_character_, nrow(df_clean)) else
+    as.character(df_clean[[clean_proj_col]])
+  discard_proj <- if (is.null(discard_proj_col)) rep(NA_character_, nrow(df_discard)) else
+    as.character(df_discard[[discard_proj_col]])
+  project_values <- unique(c(clean_proj, discard_proj))
+  project_keys <- normalize_project_key(project_values)
+  valid <- !is.na(project_keys) & grepl("^p[0-9]+$", project_keys)
+  if (any(!valid)) {
+    log_msg("Sample '", sample,
+            "': unassigned project rows remain in the combined exports only.")
+  }
+  projects <- unique(project_keys[valid])
+  for (project_key in projects) {
+    proj <- project_values[match(project_key, project_keys)]
+    dd <- df_clean[which(normalize_project_key(clean_proj) == project_key), , drop = FALSE]
+    project_overview <- overview[which(overview$project == project_key), , drop = FALSE]
     project_number <- sub("^p", "", project_key)
     project_out_dir <- fs::path(
       DIR_PROJECT_DATA, paste0(project_number, "_backbone"),
@@ -1326,9 +1620,24 @@ export_per_project <- function(df_clean,
     )
     writexl::write_xlsx(dd, filepath)
     log_msg("Wrote project-specific clean questionnaire file: ", filepath)
-  })
-  
-  log_msg(glue::glue("Exported {length(df_split)} per-project XLSX files for '{sample}'."))
+    overview_file <- fs::path(
+      project_out_dir,
+      glue::glue("{input_date}_{sample}_project-{safe_proj}_exclusions.xlsx")
+    )
+    # The reference population is shared: never recompute rushing thresholds
+    # from this project's subset. Label that shared scope in every workbook.
+    project_documentation <- documentation
+    project_documentation$run_parameters <- dplyr::bind_rows(
+      project_documentation$run_parameters,
+      tibble::tibble(parameter = c("export_project", "methods_parameter_scope"),
+                     value = c(project_key, "Parameters describe the full input sample/reference population; exclusions sheet is project-specific."))
+    )
+    writexl::write_xlsx(c(list(exclusions = project_overview), project_documentation), overview_file)
+    log_msg("Wrote project-specific exclusion overview: ", overview_file,
+            " (", nrow(project_overview), " participant entry/entries).")
+  }
+  log_msg("Exported clean files and exclusion overviews for ", length(projects),
+          " project(s) for '", sample, "'.")
 }
 
 save_keys <- function(keys, sample, input_date) {
@@ -1647,7 +1956,9 @@ process_sample <- function(sample,
                            questionnaire_path = NULL,
                            iteminfo_path = NULL,
                            scoring_df = NULL,
-                           drop_criteria_fun = remove_flagged_rows) {
+                           drop_criteria_fun = remove_flagged_rows,
+                           questionnaire_data = NULL,
+                           dropped = NULL) {
   log_msg("\n--- Processing sample: ", sample, " ---")
   
   if (is.null(questionnaire_path)) questionnaire_path <- latest_questionnaire_for_sample_local(sample)
@@ -1667,7 +1978,7 @@ process_sample <- function(sample,
     }
   }
   
-  q_raw  <- read_questionnaire(questionnaire_path)
+  q_raw <- if (is.null(questionnaire_data)) read_questionnaire(questionnaire_path) else questionnaire_data
   ii_all <- read_item_info(iteminfo_path)
   
   if (is.null(ii_all)) {
@@ -1675,10 +1986,24 @@ process_sample <- function(sample,
     return(invisible(NULL))
   }
   
-  dropped   <- drop_criteria_fun(q_raw, sample)
+  if (is.null(dropped)) dropped <- drop_criteria_fun(q_raw, sample)
   q_clean0  <- dropped$clean
   q_discard <- dropped$discarded
   
+  if (sample %in% CHILD_PARENT_SAMPLES) {
+    # Child/parent instruments are not passed through the adult scoring,
+    # adult missingness/imputation or adult demographic recoding machinery.
+    assert_flagged_participants_absent(q_clean0, dropped, sample)
+    q_ready <- remove_measurement_dates(q_clean0, ii_all, sample, "clean data")
+    q_discard <- remove_measurement_dates(q_discard, ii_all, sample, "discarded data")
+    export_per_project(
+      q_ready, q_discard, sample, input_date, item_info = ii_all,
+      audit_input = q_raw, questionnaire_path = questionnaire_path, iteminfo_path = iteminfo_path
+    )
+    log_msg("--- Done sample: ", sample, " (child/parent quality exclusions) ---\n")
+    return(invisible(list(data_clean = q_ready, data_discarded = q_discard, keys = NULL)))
+  }
+
   q_clean0 <- ensure_suq_columns(q_clean0, ii_all)
   
   parts   <- split_id_and_item_columns(q_clean0, ii_all, scoring_df)
@@ -1751,6 +2076,9 @@ process_sample <- function(sample,
   assert_fhs_columns_retained(q_clean0, q_ready, ii_all, sample)
   assert_flagged_participants_absent(q_ready, dropped, sample)
   
+  q_ready <- remove_measurement_dates(q_ready, ii_all, sample, "clean data")
+  q_discard <- remove_measurement_dates(q_discard, ii_all, sample, "discarded data")
+  ii <- ii[!(normalize_id(ii$item) %in% normalize_id(measurement_date_items(ii_all))), , drop = FALSE]
   keys <- build_keys(ii)
   save_keys(keys, sample, input_date)
   
@@ -1759,7 +2087,11 @@ process_sample <- function(sample,
     q_discard,
     sample,
     input_date = input_date,
-    item_info = ii_all
+    item_info = ii_all,
+    audit_input = q_raw,
+    missingness_audit = global_miss$missingness_audit,
+    questionnaire_path = questionnaire_path,
+    iteminfo_path = iteminfo_path
   )
   
   log_msg("--- Done sample: ", sample, " ---\n")
@@ -1789,6 +2121,16 @@ if (length(missing_questionnaires)) {
     DIR_QUESTIONNAIRES, "'. Existing clean outputs were not archived."
   )
 }
+
+# Step 02 exports P8 in children_parents and P6 in separate child/parent
+# samples. Include those exports when present; adults/adolescents stay required.
+OPTIONAL_PATHS <- stats::setNames(
+  purrr::map_chr(CHILD_PARENT_SAMPLES, latest_questionnaire_for_sample_local),
+  CHILD_PARENT_SAMPLES
+)
+OPTIONAL_PATHS <- OPTIONAL_PATHS[!is.na(OPTIONAL_PATHS) & fs::file_exists(OPTIONAL_PATHS)]
+QUESTIONNAIRE_PATHS <- c(QUESTIONNAIRE_PATHS, OPTIONAL_PATHS)
+SAMPLES_TO_PROCESS <- names(QUESTIONNAIRE_PATHS)
 
 INPUT_DATES <- purrr::map_chr(QUESTIONNAIRE_PATHS, input_date_prefix)
 initialize_run_logs(INPUT_DATES)
@@ -1828,6 +2170,12 @@ if (length(missing_iteminfo)) {
   )
 }
 
+# Compute participant exclusions jointly before writing outputs so a P6
+# parent's invariant CBCL also removes that ID's child/parent records.
+RAW_QUESTIONNAIRES <- purrr::map(QUESTIONNAIRE_PATHS, read_questionnaire)
+DROP_RESULTS <- purrr::imap(RAW_QUESTIONNAIRES, ~ remove_flagged_rows(.x, .y))
+DROP_RESULTS <- propagate_p6_cbcl_exclusions(DROP_RESULTS)
+
 # Archive the complete previous Step-03 output tree only after all required
 # input files have been located successfully and before any new file is written.
 archive_existing_clean_outputs(DIR_EXPORT)
@@ -1838,6 +2186,8 @@ results <- purrr::imap(
     sample = .y,
     questionnaire_path = .x,
     iteminfo_path = ITEMINFO_PATHS[[.y]],
-    scoring_df = SCORING
+    scoring_df = SCORING,
+    questionnaire_data = RAW_QUESTIONNAIRES[[.y]],
+    dropped = DROP_RESULTS[[.y]]
   )
 )
