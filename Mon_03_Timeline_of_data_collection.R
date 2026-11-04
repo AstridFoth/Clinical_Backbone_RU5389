@@ -2,7 +2,7 @@
 # Monitoring 3 — Timeline of Data Collection (with projections + ideal state)
 # Authors: Saskia Wilken (+ modifications)
 # Created: 2025-11-10
-# Updated: 2026-11-03
+# Updated: 2026-11-04
 #
 # What this does
 # - Reads the newest *_id_completeness_report.xlsx (by leading YYYY-MM-DD tag) and the Target_Sample_Size_Projects.xlsx
@@ -25,10 +25,8 @@
 # - Each project/group has its own color (legend).
 # - X axis spans from fixed origin 01.08.2024 to 31.12.2027 for prediction/ideal plots.
 # - p6 adults collect cognitive tests only and are complete per Mon_01.
-# - Percent uses the appropriate target. p6 adults require their own "p6 adults"
-#   row in the split target sheet; no fallback to the existing p6 target is used.
-#   Until that target is supplied, their absolute timeline is shown, while
-#   percentages and target-dependent estimates remain NA (also for aggregated p6).
+# - Percent uses the appropriate target. p6 adults use their confirmed target
+#   N = 44 (2026-11-04), without falling back to the existing p6 target.
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 # Clean up R environment -------------------------------------------------------
@@ -116,6 +114,12 @@ read_targets_split <- function(path){
 targets_vanilla <- read_targets_vanilla(target_xlsx)
 total_targets   <- setNames(targets_vanilla$target, paste0("p", targets_vanilla$project))
 targets_split   <- read_targets_split(target_xlsx)
+# Confirmed by Saskia on 2026-11-04: p6 adults target N = 44.
+# Apply to this cohort only, including when the workbook has no adult row yet.
+targets_split <- targets_split %>%
+  dplyr::filter(!(project == 6 & sample == "adults")) %>%
+  dplyr::bind_rows(tibble::tibble(project = 6L, sample = "adults", target = 44))
+
 
 max_target_vanilla <- suppressWarnings(max(as.numeric(total_targets), na.rm = TRUE))
 if (!is.finite(max_target_vanilla)) max_target_vanilla <- NA_real_

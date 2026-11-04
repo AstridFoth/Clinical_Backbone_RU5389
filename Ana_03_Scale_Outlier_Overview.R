@@ -2,7 +2,7 @@
 # Run after prep_05_Score_Scales.R. No item rescoring and no exclusions.
 # Inputs: 02_cleaned/<sample>/YYYY-MM-DD_<sample>_clean_master_scored.xlsx
 # Labels: matching 02_cleaned/keys/YYYY-MM-DD_<sample>_keys.rds (when present).
-# Output: 01_project_data/all_projects_backbone/derivatives/questionnaire_extreme_values/
+# Output: out/outlier_overview/
 #         <run timestamp>/ : workbook, heatmaps, paginated raincloud PNGs + PDF.
 # Set BACKBONE_ROOT or CFG$root if this script is stored outside the repository.
 # To load functions without running: options(backbone.extreme_values.autorun = FALSE).
@@ -640,8 +640,7 @@ run_scale_extreme_value_overview <- function(cfg = CFG) {
     sheets[[sheet_name]] <- matrix_tab
   }
   output <- cfg$output_dir
-  if (is.null(output)) output <- file.path(root, "01_project_data", "all_projects_backbone", "derivatives",
-                                          "questionnaire_extreme_values")
+  if (is.null(output)) output <- file.path(root, "out", "outlier_overview")
   run_stamp <- format(Sys.time(), "%Y-%m-%d_%H%M%S", tz = "Europe/Berlin")
   output <- file.path(output, paste0(run_stamp, "_", if (nzchar(cfg$score_suffix)) cfg$score_suffix else "full"))
   if (dir.exists(output)) stop("Output directory already exists; rerun with a new timestamp: ", output)

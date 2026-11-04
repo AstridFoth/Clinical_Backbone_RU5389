@@ -2259,6 +2259,43 @@ start_col  <- "TIME_start"
 psytool_info_adults[[project_col]][which(psytool_info_adults[[vp_col]] == 2048)]  <- 2
 psytool_info_adults[[project_col]][which(psytool_info_adults[[vp_col]] == 99017)] <- 9
 
+# Project 6 adults: resolve the two confirmed cognitive-test ID conflicts.
+# Match the supplied UTC instants explicitly: TIME_start is stored as POSIXct
+# after importing PsyToolkit's Berlin-local timestamps. Apply these corrections
+# before generic empty-row/duplicate handling so their reasons are audited.
+p6_adult_cogtest_start_utc <- format(
+  as_time_safely(psytool_info_adults$TIME_start, tz = "Europe/Berlin"),
+  format = "%Y-%m-%d %H:%M:%S",
+  tz = "UTC"
+)
+
+psytool_info_adults <- audit_id_change(
+  psytool_info_adults,
+  idx = psytool_info_adults$id == 62224L &
+    psytool_info_adults$p == 6L &
+    p6_adult_cogtest_start_utc == "2026-06-12 08:14:00",
+  id_col = "id",
+  new_id = 62204L,
+  project_col = "p",
+  sample = "adults",
+  data_type = "experiment_data",
+  criterion = "Project 6 adult cogtests: ID conflict; session 62224 at 2026-06-12 08:14:00 UTC belongs to 62204. The separate session at 2026-09-10 13:10:00 UTC retains ID 62224."
+)
+
+psytool_info_adults <- audit_row_action(
+  psytool_info_adults,
+  idx = psytool_info_adults$id == 62206L &
+    psytool_info_adults$p == 6L &
+    p6_adult_cogtest_start_utc == "2026-06-15 09:17:00",
+  id_col = "id",
+  project_col = "p",
+  sample = "adults",
+  data_type = "experiment_data",
+  criterion = "Project 6 adult cogtests: unused preparation for ID 62206 at 2026-06-15 09:17:00 UTC deleted after a last-minute rescheduling. The actual session at 2026-06-15 13:10:00 UTC is retained.",
+  action = "deleted"
+)
+rm(p6_adult_cogtest_start_utc)
+
 # Remove empty Rows ------------------------------------------------------------
 list_output           <- partition_empty_obs_psytoolkit(psytool_info_adults)
 psytool_info_adults   <- list_output$kept

@@ -7,8 +7,12 @@
 # Reads questionnaire data, filters bad rows, reverse-codes items, applies
 # questionnaire-specific item-level preprocessing, enriches demographics/health,
 # writes item-level clean masters, per-project exports, sanity logs, and keys.
+# Reviewed manual FHS item corrections are applied here before clean exports.
 # Per-project clean files go to 01_project_data/<project>_backbone/derivatives/
-# questionnaires; combined masters, keys and logs keep their existing locations.
+# questionnaire; combined masters, keys and logs keep their existing locations.
+# Each available sample's clean master is also copied to all_projects_backbone/
+# derivatives/questionnaire/<download-date>_cleaned-questionnaire-data/ as
+# <sample>_clean_master.xlsx. The date comes from that sample's input filename.
 # Previous 02_cleaned outputs are archived under 02_cleaned/old as before.
 # Adds fixed, frequency-only CAPE positive subfactor keys from Schlier et al.
 # (2015), Table 2, alongside the existing CAPE keys. Run steps 03 -> 04 -> 05.
@@ -1699,10 +1703,18 @@ export_per_project <- function(df_clean,
   )
   
   writexl::write_xlsx(df_clean, master_path)
+  shared_clean_dir <- fs::path(
+    DIR_PROJECT_DATA, "all_projects_backbone", "derivatives", "questionnaire",
+    glue::glue("{input_date}_cleaned-questionnaire-data")
+  )
+  fs::dir_create(shared_clean_dir)
+  shared_clean_path <- fs::path(shared_clean_dir, glue::glue("{sample}_clean_master.xlsx"))
+  fs::file_copy(master_path, shared_clean_path, overwrite = TRUE)
   fs::dir_create(fs::path_dir(disc_path))
   writexl::write_xlsx(df_discard, disc_path)
   
   log_msg("Wrote master (items only, no score columns): ", master_path)
+  log_msg("Copied clean questionnaire master to: ", shared_clean_path)
   log_msg("Wrote discarded: ", disc_path)
   
   for (i in seq_len(nrow(overview))) {
@@ -1732,7 +1744,7 @@ export_per_project <- function(df_clean,
     project_number <- sub("^p", "", project_key)
     project_out_dir <- fs::path(
       DIR_PROJECT_DATA, paste0(project_number, "_backbone"),
-      "derivatives", "questionnaires"
+      "derivatives", "questionnaire"
     )
     fs::dir_create(project_out_dir)
     safe_proj <- gsub("[^A-Za-z0-9_-]+", "_", proj)
@@ -1777,6 +1789,76 @@ save_keys <- function(keys, sample, input_date) {
 }
 
 # ---- FHS family-tree consistency cleanup --------------------------------------
+# Auditable carry-over of the reviewed free-text corrections from
+# 2026_05_21_Chramow_Wende_scoring_quality_check.R. These corrections are
+# applied in Step 03 so clean masters and per-project clean exports already
+# contain them. Only existing participants and target columns are changed.
+FHS_LEGACY_CONFIDENCE_CORRECTIONS <- tibble::tribble(
+  ~vp_id,  ~column_compact,                 ~value,
+  "20014", "psyconfidenceparent1",              2,
+  "20014", "sudconfidenceparent1",              2,
+  "30007", "depressionconfidenceparent1",       3,
+  "30007", "maniaconfidenceparent1",            2,
+  "30041", "depressionconfidenceparent1",       3,
+  "30066", "sudconfidenceparent2",              2,
+  "50058", "sudconfidenceparent1",              2,
+  "50058", "sudconfidenceparent2",              2,
+  "70004", "sudconfidenceparent2",              2,
+  "70231", "depressionconfidenceparent2",       3,
+  "70115", "gasconfidenceself",                 3
+)
+
+FHS_LEGACY_DIAGNOSIS_CORRECTIONS <- tibble::tribble(
+  ~vp_id,  ~column_compact,       ~value,
+  "20014", "ownpsychdiagnpsy",   "Y",
+  "20023", "ownpsychdiagnpsy",   "Y",
+  "32071", "ownpsychdiagnmde",   "Y",
+  "80002", "ownpsychdiagnmde",   "Y",
+  "90015", "ownpsychdiagnpsy",   "Y"
+)
+
+apply_fhs_legacy_corrections <- function(df, id_col, sample) {
+  if (is.null(id_col) || is.na(id_col) || !id_col %in% names(df)) {
+    log_msg(
+      "Legacy FHS corrections for sample '", sample,
+      "' skipped because no participant-ID column was found."
+    )
+    return(df)
+  }
+
+  id_values <- trimws(as.character(df[[id_col]]))
+  column_compact <- gsub("[^a-z0-9]", "", tolower(names(df)))
+  n_applied <- 0L
+
+  for (i in seq_len(nrow(FHS_LEGACY_CONFIDENCE_CORRECTIONS))) {
+    correction <- FHS_LEGACY_CONFIDENCE_CORRECTIONS[i, ]
+    target_col_index <- match(correction$column_compact, column_compact)
+    target_rows <- !is.na(id_values) & id_values == correction$vp_id
+    if (!is.na(target_col_index) && any(target_rows)) {
+      target_col <- names(df)[target_col_index]
+      df[[target_col]][target_rows] <- correction$value
+      n_applied <- n_applied + sum(target_rows)
+    }
+  }
+
+  for (i in seq_len(nrow(FHS_LEGACY_DIAGNOSIS_CORRECTIONS))) {
+    correction <- FHS_LEGACY_DIAGNOSIS_CORRECTIONS[i, ]
+    target_col_index <- match(correction$column_compact, column_compact)
+    target_rows <- !is.na(id_values) & id_values == correction$vp_id
+    if (!is.na(target_col_index) && any(target_rows)) {
+      target_col <- names(df)[target_col_index]
+      df[[target_col]][target_rows] <- correction$value
+      n_applied <- n_applied + sum(target_rows)
+    }
+  }
+
+  log_msg(
+    "Applied ", n_applied, " legacy reviewed FHS correction(s) in sample '",
+    sample, "'."
+  )
+  df
+}
+
 clean_duplicate_parent_gender <- function(df, sample) {
   # The FHS asks separately for the gender of parent 1 and parent 2.
   # If both non-missing entries are identical, the pair is internally
@@ -2189,6 +2271,7 @@ process_sample <- function(sample,
     )
   }
   q_final <- q_final %>% dplyr::select(dplyr::any_of(id_cols), dplyr::everything())
+  q_final <- apply_fhs_legacy_corrections(q_final, find_participant_id_col(q_final), sample)
   q_final <- clean_duplicate_parent_gender(q_final, sample)
   grouping_map <- read_groupings_for_sample(sample)
   q_final <- attach_groupings(q_final, sample, groupings = grouping_map)

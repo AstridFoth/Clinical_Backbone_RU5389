@@ -8,6 +8,7 @@
 # optionally removes low-loading items flagged by analyze_backbone_scales.R,
 # computes score_* columns plus FHS family-history outputs, and writes scored
 # masters without dropping participants who have no FHS response.
+# Reviewed manual FHS item corrections are already applied by Step 03.
 # Also exports fixed CAPE positive frequency subfactor sums and means from
 # Schlier et al. (2015), Table 2, alongside the original CAPE scores.
 # Run the updated Step 03 first to regenerate matching keys.
@@ -36,7 +37,6 @@ CFG <- list(
   min_prop_items_default = 0.30,
   add_z_scores_to_scored_masters = FALSE,
   fhs_confidence_cutoff = 1,
-  fhs_apply_legacy_manual_corrections = TRUE,
   # For reduced/loading-filtered score variants, use means so scores remain
   # interpretable when the number of retained items differs from the original scale.
   force_filtered_scores_to_mean = TRUE,
@@ -53,33 +53,6 @@ CFG <- list(
 NON_SCORABLE_SCALES <- c(
   "FHSfamilytree", "health", "demographics", "times",
   "date", "id", "project"
-)
-
-# Auditable carry-over of the reviewed free-text corrections from
-# 2026_05_21_Chramow_Wende_scoring_quality_check.R. These corrections are
-# applied only when both the participant and target column exist.
-FHS_LEGACY_CONFIDENCE_CORRECTIONS <- tibble::tribble(
-  ~vp_id,  ~column_compact,                 ~value,
-  "20014", "psyconfidenceparent1",              2,
-  "20014", "sudconfidenceparent1",              2,
-  "30007", "depressionconfidenceparent1",       3,
-  "30007", "maniaconfidenceparent1",            2,
-  "30041", "depressionconfidenceparent1",       3,
-  "30066", "sudconfidenceparent2",              2,
-  "50058", "sudconfidenceparent1",              2,
-  "50058", "sudconfidenceparent2",              2,
-  "70004", "sudconfidenceparent2",              2,
-  "70231", "depressionconfidenceparent2",       3,
-  "70115", "gasconfidenceself",                 3
-)
-
-FHS_LEGACY_DIAGNOSIS_CORRECTIONS <- tibble::tribble(
-  ~vp_id,  ~column_compact,       ~value,
-  "20014", "ownpsychdiagnpsy",   "Y",
-  "20023", "ownpsychdiagnpsy",   "Y",
-  "32071", "ownpsychdiagnmde",   "Y",
-  "80002", "ownpsychdiagnmde",   "Y",
-  "90015", "ownpsychdiagnpsy",   "Y"
 )
 
 script_dir <- function() {
@@ -1063,49 +1036,6 @@ first_fhs_column <- function(df, compact_targets) {
   NA_character_
 }
 
-apply_fhs_legacy_corrections <- function(df, id_col, sample) {
-  if (!isTRUE(CFG$fhs_apply_legacy_manual_corrections)) return(df)
-  if (is.na(id_col) || !id_col %in% names(df)) {
-    log_msg(
-      "Legacy FHS corrections for sample '", sample,
-      "' skipped because no participant-ID column was found."
-    )
-    return(df)
-  }
-
-  id_values <- trimws(as.character(df[[id_col]]))
-  column_compact <- fhs_compact_name(names(df))
-  n_applied <- 0L
-
-  for (i in seq_len(nrow(FHS_LEGACY_CONFIDENCE_CORRECTIONS))) {
-    correction <- FHS_LEGACY_CONFIDENCE_CORRECTIONS[i, ]
-    target_col_index <- match(correction$column_compact, column_compact)
-    target_rows <- !is.na(id_values) & id_values == correction$vp_id
-    if (!is.na(target_col_index) && any(target_rows)) {
-      target_col <- names(df)[target_col_index]
-      df[[target_col]][target_rows] <- correction$value
-      n_applied <- n_applied + sum(target_rows)
-    }
-  }
-
-  for (i in seq_len(nrow(FHS_LEGACY_DIAGNOSIS_CORRECTIONS))) {
-    correction <- FHS_LEGACY_DIAGNOSIS_CORRECTIONS[i, ]
-    target_col_index <- match(correction$column_compact, column_compact)
-    target_rows <- !is.na(id_values) & id_values == correction$vp_id
-    if (!is.na(target_col_index) && any(target_rows)) {
-      target_col <- names(df)[target_col_index]
-      df[[target_col]][target_rows] <- correction$value
-      n_applied <- n_applied + sum(target_rows)
-    }
-  }
-
-  log_msg(
-    "Applied ", n_applied, " legacy reviewed FHS correction(s) in sample '",
-    sample, "'."
-  )
-  df
-}
-
 fhs_numeric_matrix <- function(df, columns) {
   if (!length(columns)) {
     return(matrix(numeric(0), nrow = nrow(df), ncol = 0L))
@@ -1141,7 +1071,6 @@ add_fhs_scores <- function(df, sample, item_info = NULL) {
 
   work <- df
   id_col <- first_fhs_column(work, c("vp_id", "vpid", "id"))
-  work <- apply_fhs_legacy_corrections(work, id_col, sample)
 
   present_matrix <- do.call(
     cbind,

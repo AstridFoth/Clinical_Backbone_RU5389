@@ -1,7 +1,7 @@
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # Monitoring 2 — Visualize Backbone Progress
 # Authors: Saskia Wilken (saskia.wilken@uni-hamburg.de, saskia.a.wilken@gmail.com)
-# Updated: 2026-11-03
+# Updated: 2026-11-04
 #
 # RUN MON_01 first!
 #
@@ -12,8 +12,7 @@
 #       3) datasets missing cognitive test data (=> questionnaires present)
 #  - Produces a progress plot (PNG) and a summary XLSX.
 #  - p6 adults require cognitive tests only (classified as complete by Mon_01).
-#    Their target must be specified separately as "p6 adults" in the split target
-#    sheet; until then it remains unknown, without using the existing p6 target.
+#    Their confirmed cohort-specific target is N = 44 (2026-11-04).
 #
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -94,6 +93,12 @@ read_targets_split <- function(path){
     dplyr::select(project, sample, target)
 }
 targets_split <- read_targets_split(target_xlsx)
+# Confirmed by Saskia on 2026-11-04: p6 adults target N = 44.
+# Apply to this cohort only, including when the workbook has no adult row yet.
+targets_split <- targets_split %>%
+  dplyr::filter(!(project == 6 & sample == "adults")) %>%
+  dplyr::bind_rows(tibble::tibble(project = 6L, sample = "adults", target = 44))
+
 
 # ---- Read latest report ----
 priv_dir <- file.path(ROOT, "private_information", "ids_in_all_projects")
@@ -367,7 +372,7 @@ progress_counts_split <- base_rows %>%
   # Join per-(project,sample) targets from the P8_Split_P6.2_only sheet
   dplyr::left_join(targets_split, by = c("project","sample")) %>%
   dplyr::rename(sample_target = target) %>%
-  # p6 adults use ONLY their own target; it may be added to the target sheet later.
+  # p6 adults use ONLY their own confirmed target (N = 44).
   # Preserve the existing project-target fallback for all other samples.
   dplyr::mutate(
     sample_target = dplyr::if_else(project == 6 & sample == "adults",
