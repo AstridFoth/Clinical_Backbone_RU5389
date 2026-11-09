@@ -1797,6 +1797,7 @@ FHS_LEGACY_CONFIDENCE_CORRECTIONS <- tibble::tribble(
   ~vp_id,  ~column_compact,                 ~value,
   "20014", "psyconfidenceparent1",              2,
   "20014", "sudconfidenceparent1",              2,
+  "20101", "ocdconfidencechild1",               2,
   "30007", "depressionconfidenceparent1",       3,
   "30007", "maniaconfidenceparent1",            2,
   "30041", "depressionconfidenceparent1",       3,
@@ -1805,16 +1806,25 @@ FHS_LEGACY_CONFIDENCE_CORRECTIONS <- tibble::tribble(
   "50058", "sudconfidenceparent2",              2,
   "70004", "sudconfidenceparent2",              2,
   "70231", "depressionconfidenceparent2",       3,
-  "70115", "gasconfidenceself",                 3
+  "70115", "gasconfidenceself",                 3,
+  "70262", "Maniaconfidence_sibling2",          3,
+  "80097", "Depressionconfidence_parent2",      3,
+  "90049", "Sudconfidence_sibling1",            2
+  
 )
 
 FHS_LEGACY_DIAGNOSIS_CORRECTIONS <- tibble::tribble(
   ~vp_id,  ~column_compact,       ~value,
   "20014", "ownpsychdiagnpsy",   "Y",
   "20023", "ownpsychdiagnpsy",   "Y",
+  "20101", "ocd1_child1",        "Y",
   "32071", "ownpsychdiagnmde",   "Y",
+  "70262", "Mania1_sibling2",    "Y",
   "80002", "ownpsychdiagnmde",   "Y",
-  "90015", "ownpsychdiagnpsy",   "Y"
+  "80090", "ownpsychdiagnmde",   "Y",
+  "80097", "Depression1_parent2","Y",
+  "90015", "ownpsychdiagnpsy",   "Y",
+  "90049", "Sud1_sibling1",      "Y"
 )
 
 apply_fhs_legacy_corrections <- function(df, id_col, sample) {
